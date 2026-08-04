@@ -11,8 +11,13 @@ struct AITokenTotals: Codable, Equatable {
 /// skill on 2026-07-02 — update here when providers change pricing.
 enum AIPricing {
     /// claude-haiku-4-5: $1.00 / 1M input tokens, $5.00 / 1M output tokens.
+    /// Still used to price meetings recorded while the app ran on Haiku.
     static let haikuInputUSDPerMTok = 1.00
     static let haikuOutputUSDPerMTok = 5.00
+    /// claude-sonnet-5: $3.00 / 1M input, $15.00 / 1M output (list price; an
+    /// intro rate of $2/$10 runs through 2026-08-31 — list is the safe estimate).
+    static let sonnetInputUSDPerMTok = 3.00
+    static let sonnetOutputUSDPerMTok = 15.00
     /// Groq whisper-large-v3-turbo: $0.04 per audio hour.
     static let groqUSDPerAudioHour = 0.04
     /// Deepgram Nova-3 streaming: $0.29 per audio hour per stream — matches the
@@ -117,8 +122,13 @@ struct AIUsage: Codable {
                             detail: tokens + " · rates not tracked", usd: 0)
         default:
             // Claude (nil = meetings recorded before provider selection).
-            let usd = Double(totals.inputTokens) / 1_000_000 * AIPricing.haikuInputUSDPerMTok
-                + Double(totals.outputTokens) / 1_000_000 * AIPricing.haikuOutputUSDPerMTok
+            // Rate follows the RECORDED model name, so meetings from the Haiku
+            // era stay priced at Haiku rates after the app moved to Sonnet.
+            let rates = model.contains("haiku")
+                ? (input: AIPricing.haikuInputUSDPerMTok, output: AIPricing.haikuOutputUSDPerMTok)
+                : (input: AIPricing.sonnetInputUSDPerMTok, output: AIPricing.sonnetOutputUSDPerMTok)
+            let usd = Double(totals.inputTokens) / 1_000_000 * rates.input
+                + Double(totals.outputTokens) / 1_000_000 * rates.output
             return LineItem(label: "\(prefix) \(model)", detail: tokens, usd: usd)
         }
     }

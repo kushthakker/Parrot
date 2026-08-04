@@ -10,17 +10,17 @@ import Foundation
 /// ground truth (mic vs system audio) and must never be rewritten by a model.
 /// Best-effort like polish was: any failure keeps the live transcript.
 enum TranscriptCleaner {
-    /// Same model the copilot/summary calls use — cleanup is mechanical work
-    /// where Haiku's speed and cost fit; it caps output at 64k tokens, far
-    /// above a chunk's worst case.
+    /// Same model the summary/report calls use (Sonnet 5) — one model, one
+    /// key, one line in the cost row per job.
     static let model = ClaudeAnalysisProvider.model
 
     /// Segments per request. Bounds each response well under max_tokens while
     /// giving the model enough surrounding conversation to fix words from
     /// context. Utterance-sized lines run ~10-40 words; 60 lines ≈ well under
-    /// 4k output tokens even echoed verbatim.
+    /// 4k output tokens even echoed verbatim. max_tokens carries extra
+    /// headroom because Sonnet 5's adaptive thinking counts against it too.
     static let chunkSize = 60
-    static let maxTokens = 8000
+    static let maxTokens = 12000
 
     /// Reject a "cleaned" line that shrank or grew past these ratios of the
     /// original: cleanup fixes words and punctuation, it never summarizes or

@@ -8,6 +8,7 @@ struct MenuBarView: View {
     @Environment(RecordingManager.self) private var recordingManager
     @Environment(ProfileStore.self) private var profileStore
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         if recordingManager.isRecording {
@@ -44,10 +45,8 @@ struct MenuBarView: View {
         Divider()
 
         Button("Open Parrot") {
-            NSApp.activate(ignoringOtherApps: true)
-            if let window = NSApp.windows.first(where: { $0.title != "Item-0" }) {
-                window.makeKeyAndOrderFront(nil)
-            }
+            // Shows the Dock icon too; it retracts when the window closes.
+            DockVisibility.openMain(using: { openWindow(id: "main") })
         }
 
         Divider()

@@ -90,9 +90,12 @@ enum AnalysisError: LocalizedError {
     }
 }
 
-/// Calls the Claude API (Haiku — fastest model) for low-latency structured insights.
+/// Calls the Claude API for structured insights and post-call reports.
+/// Sonnet 5: near-Opus quality on analysis work; runs adaptive thinking by
+/// default, and max_tokens caps thinking + response together — hence the
+/// generous budgets on each request below.
 final class ClaudeAnalysisProvider: AnalysisProvider {
-    static let model = "claude-haiku-4-5"
+    static let model = "claude-sonnet-5"
     private let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
 
     var isConfigured: Bool {
@@ -318,7 +321,7 @@ final class ClaudeAnalysisProvider: AnalysisProvider {
 
         let body: [String: Any] = [
             "model": Self.model,
-            "max_tokens": 1024,
+            "max_tokens": 2048,
             "system": sys,
             "messages": [["role": "user", "content": userContent]],
             "output_config": ["format": ["type": "json_schema", "schema": schemaObj]],
@@ -377,7 +380,7 @@ final class ClaudeAnalysisProvider: AnalysisProvider {
 
         let body: [String: Any] = [
             "model": Self.model,
-            "max_tokens": 1500,
+            "max_tokens": 4000,
             "system": Self.summarySystemPrompt(counterpart: counterpart),
             "messages": [["role": "user", "content": sections.joined(separator: "\n\n---\n\n")]],
         ]
@@ -435,7 +438,7 @@ final class ClaudeAnalysisProvider: AnalysisProvider {
 
         let body: [String: Any] = [
             "model": Self.model,
-            "max_tokens": 1200,
+            "max_tokens": 3000,
             "system": Self.coachingSystemPrompt(counterpart: counterpart),
             "messages": [["role": "user", "content": sections.joined(separator: "\n\n---\n\n")]],
         ]

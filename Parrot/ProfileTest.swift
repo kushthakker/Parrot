@@ -403,6 +403,12 @@ enum ProfileTest {
         let items = usage.costBreakdown()
         check("cost has 3 line items", items.count == 3)
         check("copilot cost $2.00", abs(items[0].usd - 2.00) < 0.0001)
+        // Sonnet-labeled buckets price at Sonnet 5 rates ($3 in / $15 out per MTok).
+        var sonnet = AIUsage()
+        sonnet.copilotModel = "claude-sonnet-5"
+        sonnet.copilot = AITokenTotals(inputTokens: 1_000_000, outputTokens: 200_000, calls: 3)
+        check("sonnet bucket priced at sonnet rates",
+              abs(sonnet.costBreakdown()[0].usd - (3.00 + 3.00)) < 0.0001)
         check("copilot detail has calls + tokens", items[0].detail.contains("41 calls") && items[0].detail.contains("1000k in"))
         check("deepgram cost matches $0.29/hr rate", abs(items[1].usd - 1200.0 / 3600 * 0.29) < 0.0001)
         // The real invoice this rate was verified against: 1:50 call, 2 streams.
