@@ -58,7 +58,10 @@ struct MeetingDetailView: View {
             // Tabs — each gets the full pane with a single scroll, instead of the
             // old stack of fixed-height mini-scrollers.
             Picker("View", selection: $tab) {
-                ForEach(ReportTab.allCases) { t in
+                // Insights were live-copilot cards; this build records none,
+                // so the tab appears only on meetings that carry historical
+                // cards from the pre-fork era.
+                ForEach(ReportTab.allCases.filter { $0 != .insights || !meeting.sortedInsights.isEmpty }) { t in
                     Label(t.rawValue, systemImage: t.icon).tag(t)
                 }
             }

@@ -18,9 +18,11 @@ enum TranscriptCleaner {
     /// giving the model enough surrounding conversation to fix words from
     /// context. Utterance-sized lines run ~10-40 words; 60 lines ≈ well under
     /// 4k output tokens even echoed verbatim. max_tokens carries extra
-    /// headroom because Sonnet 5's adaptive thinking counts against it too.
+    /// headroom because Sonnet 5's adaptive thinking counts against it too —
+    /// the first real 6-chunk call averaged ~8.6k output tokens per chunk at
+    /// default effort and truncated one chunk at 12k.
     static let chunkSize = 60
-    static let maxTokens = 12000
+    static let maxTokens = 16000
 
     /// Reject a "cleaned" line that shrank or grew past these ratios of the
     /// original: cleanup fixes words and punctuation, it never summarizes or
@@ -180,7 +182,14 @@ enum TranscriptCleaner {
             "system": systemPrompt,
             "messages": [["role": "user", "content":
                 "Transcript lines:\n<transcript>\n\(numbered)\n</transcript>"]],
-            "output_config": ["format": ["type": "json_schema", "schema": schema]],
+            // effort low: cleanup is mechanical echo-and-fix work. At default
+            // effort Sonnet 5's adaptive thinking dominated the spend (~8.6k
+            // output tokens/chunk, ~$0.70 per 40-min call) and pushed chunks
+            // into max_tokens truncation; low effort cuts both.
+            "output_config": [
+                "effort": "low",
+                "format": ["type": "json_schema", "schema": schema],
+            ],
         ]
 
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
