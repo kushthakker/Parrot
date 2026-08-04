@@ -314,37 +314,20 @@ struct SettingsView: View {
 
     private var copilotPage: some View {
         Form {
-            Section("Live Call Copilot") {
-                Toggle("Enable Copilot during recordings", isOn: $copilotEnabled)
-                Hint("Suggests answers, flags blockers, and captures action items live — no button needed.")
+            // The live in-call copilot is removed in this build — nothing calls
+            // a model while a meeting is running. This toggle now gates the
+            // post-call AI only; its key ("copilotEnabled") is kept so existing
+            // installs carry their choice over.
+            Section("AI After the Call") {
+                Toggle("Write an AI report after each call", isOn: $copilotEnabled)
+                Hint("Summary, coaching, and follow-ups are written when the call ends, from the final (cleaned) transcript. Nothing runs during the meeting — live in-call suggestions are removed in this build.")
 
                 HStack(spacing: 6) {
-                    Hint("What it says and watches for is set per call profile.")
+                    Hint("Report tone and framing are set per call profile.")
                     Button("Open Profiles") { section = .profiles }
                         .buttonStyle(.link)
                         .font(Theme.Typography.secondary)
                 }
-            }
-
-            // What each call costs, in the user's hands: how often the model is
-            // asked, and how much conversation each request carries. Both apply
-            // live, mid-call. Fast + Standard = the original behavior.
-            Section("Pace") {
-                Picker("How often Copilot asks the model", selection: $copilotPace) {
-                    ForEach(CopilotPace.allCases) { pace in
-                        Text(pace.label).tag(pace.rawValue)
-                    }
-                }
-                .pickerStyle(.radioGroup)
-                Hint((CopilotPace(rawValue: copilotPace) ?? .fast).caption)
-
-                Picker("Conversation sent per request", selection: $copilotWindow) {
-                    ForEach(CopilotWindow.allCases) { window in
-                        Text(window.label).tag(window.rawValue)
-                    }
-                }
-                .pickerStyle(.menu)
-                Hint("Only recent talk is sent — insight cards always go along, so Copilot still remembers the whole call. Smaller is cheaper and faster, especially on free or local models.")
             }
 
             Section("Model") {

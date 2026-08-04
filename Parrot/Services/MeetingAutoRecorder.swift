@@ -42,6 +42,9 @@ final class MeetingAutoRecorder {
     private var lastSpeechAt = Date()
     /// First tick at which no Meet event was ongoing anymore (drives the cap).
     private var meetEndedAt: Date?
+    /// Ticks await (calendar ask, start/stop recording) long enough for the
+    /// next timer fire to interleave on the main actor — one tick at a time.
+    private var tickInFlight = false
 
     func start(recordingManager: RecordingManager, modelContext: ModelContext) {
         self.recordingManager = recordingManager
@@ -56,6 +59,12 @@ final class MeetingAutoRecorder {
 
     private func tick() async {
         guard Self.isEnabled, let manager = recordingManager, let modelContext else { return }
+        // Never prompt for Calendar while onboarding is still walking the
+        // user through the screen/mic grants.
+        guard UserDefaults.standard.bool(forKey: "hasCompletedOnboarding") else { return }
+        guard !tickInFlight else { return }
+        tickInFlight = true
+        defer { tickInFlight = false }
 
         // Calendar access — one ask, then silent.
         if EKEventStore.authorizationStatus(for: .event) != .fullAccess {
@@ -81,7 +90,10 @@ final class MeetingAutoRecorder {
         }
 
         // While recording, keep the speech clock fresh from the live audio
-        // levels and the committed transcript — either stream counts.
+        // levels and the committed transcript — either stream counts. Any
+        // running recording (manual or auto) also counts as covering the
+        // ongoing Meet events: mark them handled so stopping it isn't
+        // answered with an auto-restart for the same meeting.
         if manager.isRecording {
             if manager.audioCaptureManager.audioLevel > 0.003
                 || manager.audioCaptureManager.micLevel > 0.003 {
@@ -91,6 +103,7 @@ final class MeetingAutoRecorder {
                let lastSegmentEnd = manager.currentMeeting?.segments.map(\.endTime).max() {
                 lastSpeechAt = max(lastSpeechAt, start.addingTimeInterval(lastSegmentEnd))
             }
+            for event in ongoingMeet { handledOccurrences.insert(Self.occurrenceKey(event)) }
         }
 
         // The user pressed Stop on an auto-started recording: respect it —
