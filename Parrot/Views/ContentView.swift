@@ -9,7 +9,6 @@ struct ContentView: View {
     @State private var showDashboard = true
     @State private var showSettings = false
     @State private var searchText = ""
-    @State private var hasLoadedModel = false
     /// File → Import Audio… (⌘O); the dashboard has its own importer button.
     @State private var showMenuImporter = false
     private let updateChecker = UpdateChecker.shared
@@ -81,11 +80,14 @@ struct ContentView: View {
         ) { result in
             if case .success(let url) = result { startImport(url) }
         }
-        .task {
+        .onAppear {
             updateChecker.checkIfDue()
-            guard !hasLoadedModel else { return }
-            hasLoadedModel = true
-            await recordingManager.prepare(modelContext: modelContext)
+            // Unstructured on purpose: in menu-bar-first mode the launch
+            // window closes right away, and a structured .task would be
+            // cancelled with it — taking the Whisper model load (and with it
+            // auto-record) down too. prepare() is idempotent, so window
+            // reopens are free.
+            Task { await recordingManager.prepare(modelContext: modelContext) }
         }
     }
 

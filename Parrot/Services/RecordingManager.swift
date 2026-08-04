@@ -70,8 +70,15 @@ final class RecordingManager {
         isRecording = true
     }
 
+    /// One-shot per app run: prepare is kicked off from the main window's
+    /// view, and in menu-bar-first mode that window is created and torn down
+    /// repeatedly — every reopen calls this again.
+    private var didPrepare = false
+
     /// Initialize and load the default WhisperKit model
     func prepare(modelContext: ModelContext) async {
+        guard !didPrepare else { return }
+        didPrepare = true
         self.modelContext = modelContext
         recoverInterruptedRecordings(in: modelContext)
         profileStore.seedAndMigrateIfNeeded(context: modelContext, knowledgeBase: knowledgeBase)
