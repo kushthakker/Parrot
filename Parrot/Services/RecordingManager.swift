@@ -14,6 +14,9 @@ final class RecordingManager {
     let callAnalysisEngine = CallAnalysisEngine(provider: SwitchingAnalysisProvider())
     let knowledgeBase = KnowledgeBaseService()
     let profileStore = ProfileStore()
+    /// Starts/stops recordings automatically for calendar events carrying a
+    /// Google Meet link. Started in prepare(); gated by its Settings toggle.
+    let autoRecorder = MeetingAutoRecorder()
 
     /// Optional one-line context for the next call, set from the dashboard.
     var nextCallBrief = ""
@@ -72,6 +75,7 @@ final class RecordingManager {
         self.modelContext = modelContext
         recoverInterruptedRecordings(in: modelContext)
         profileStore.seedAndMigrateIfNeeded(context: modelContext, knowledgeBase: knowledgeBase)
+        autoRecorder.start(recordingManager: self, modelContext: modelContext)
         await transcriptionEngine.loadModel(
             UserDefaults.standard.string(forKey: "whisperModel") ?? "base"
         )
@@ -132,7 +136,7 @@ final class RecordingManager {
             callAnalysisEngine.provider.resetUsage()
             await generateSummary(meeting: meeting)
         }
-        writeAIUsage(meeting: meeting, polishSeconds: 0)
+        writeAIUsage(meeting: meeting)
         meeting.status = .done
         try? modelContext?.save()
     }
@@ -204,22 +208,18 @@ final class RecordingManager {
             self?.transcriptionEngine.reanchorLocalClock(source: .me)
         }
 
-        // Wire transcription output to storage and the live copilot
+        // Wire transcription output to storage. The live copilot loop is
+        // deliberately NOT started: mid-call LLM cards are off in this build —
+        // the AI budget goes to the post-call cleanup + report instead, and the
+        // call itself runs with zero analysis overhead.
         transcriptionEngine.onSegment = { [weak self] result in
             Task { @MainActor in
                 self?.addSegment(result)
-                self?.callAnalysisEngine.ingest(
-                    text: result.text,
-                    at: result.endTime,
-                    source: result.source
-                )
             }
         }
 
-        // Start transcription and the copilot loop
         transcriptionEngine.startTranscribing(meetingStartTime: .now)
         callAnalysisEngine.provider.resetUsage()  // this call's token meter starts at zero
-        callAnalysisEngine.start(profile: profile, brief: nextCallBrief)
 
         currentMeeting = meeting
         recordingStartTime = .now
@@ -244,11 +244,9 @@ final class RecordingManager {
         timer?.invalidate()
         timer = nil
 
-        // Stop the copilot (its ingest no-ops once inactive), then capture — so
-        // the transcription buffers stop growing and the drain below terminates.
-        // Capture stops first also so both .caf files are finalized before the
-        // diarization task can read them.
-        callAnalysisEngine.stop()
+        // Stop capture first so the transcription buffers stop growing and the
+        // drain below terminates, and so both .caf files are finalized before
+        // the post-processing task can read them.
         await audioCaptureManager.stopCapture()
 
         // Drain the transcription backlog so the call's final words land before
@@ -262,29 +260,26 @@ final class RecordingManager {
         if let meeting = currentMeeting {
             meeting.duration = elapsedTime
             meeting.status = .processing
-
-            // Persist the copilot's insights so they survive into the meeting report.
-            // Same SwiftData rule as addSegment: insert before setting the relationship.
-            for insight in callAnalysisEngine.insights {
-                let stored = CallInsight(from: insight)
-                modelContext?.insert(stored)
-                stored.meeting = meeting
-            }
             try? modelContext?.save()
 
-            // Post-processing chain, strictly sequential: polish rebuilds the
-            // transcript (optional, best-effort), diarization refines labels on
-            // whatever transcript survived, and the report is generated from
-            // the FINAL text — never from a transcript that's about to change.
+            // Post-processing chain, strictly sequential: the calendar lookup
+            // names who the call was with, Claude cleans the transcript text
+            // in place (optional, best-effort), and the report is generated
+            // from the FINAL text — never from a transcript that's about to
+            // change. postProcess stays for the import path; for live
+            // two-track recordings it's a no-op that preserves Me/Them.
             let meetingRef = meeting
             Task {
-                let polishSeconds = await self.polishTranscript(meeting: meetingRef)
+                let counterpart = await CalendarLookup.counterpartName(
+                    around: meetingRef.date, duration: meetingRef.duration)
+                let cleaning = await self.cleanTranscript(
+                    meeting: meetingRef, counterpart: counterpart)
                 await self.postProcess(meeting: meetingRef)
                 if self.callAnalysisEngine.isEnabled, self.callAnalysisEngine.provider.isConfigured {
-                    await self.generateSummary(meeting: meetingRef)
+                    await self.generateSummary(meeting: meetingRef, counterpartName: counterpart)
                 }
                 // Last in the chain so the meter has seen the summary/coaching calls too.
-                self.writeAIUsage(meeting: meetingRef, polishSeconds: polishSeconds)
+                self.writeAIUsage(meeting: meetingRef, cleaning: cleaning)
                 meetingRef.status = .done
                 try? self.modelContext?.save()
             }
@@ -387,7 +382,7 @@ final class RecordingManager {
             callAnalysisEngine.provider.resetUsage()
             await generateSummary(meeting: meeting, includeCoaching: false)
         }
-        writeAIUsage(meeting: meeting, polishSeconds: 0, backendOverride: .local)
+        writeAIUsage(meeting: meeting, backendOverride: .local)
         meeting.status = .done
         try? modelContext?.save()
     }
@@ -473,7 +468,11 @@ final class RecordingManager {
     /// `includeCoaching` is false for imported files: a single mixed track has no
     /// "Me" channel, so talk-ratio/coaching would be measured against 0% and read
     /// as broken. The summary itself works fine from any transcript.
-    private func generateSummary(meeting: Meeting, includeCoaching: Bool = true) async {
+    /// `counterpartName` is the calendar invite's attendee(s) when the lookup
+    /// found the meeting — the report then names the real person instead of
+    /// the profile's generic "the other person".
+    private func generateSummary(meeting: Meeting, includeCoaching: Bool = true,
+                                 counterpartName: String? = nil) async {
         let segments = meeting.sortedSegments
         guard !segments.isEmpty else { return }
 
@@ -482,7 +481,7 @@ final class RecordingManager {
             .joined(separator: "\n")
         let insightTitles = meeting.sortedInsights.map { "\($0.style.label): \($0.title)" }
         let instructions = meeting.profile?.tone ?? (UserDefaults.standard.string(forKey: "copilotInstructions") ?? "")
-        let counterpart = meeting.profile?.counterpart ?? "the other person"
+        let counterpart = counterpartName ?? meeting.profile?.counterpart ?? "the other person"
 
         do {
             let summary = try await callAnalysisEngine.provider.summarize(
@@ -519,59 +518,39 @@ final class RecordingManager {
         }
     }
 
-    // MARK: - Post-call polish
+    // MARK: - Post-call cleanup
 
-    /// Re-transcribe the saved audio through Groq's large model and replace the
-    /// live transcript with the cleaner one. Opt-in, best-effort: any failure
-    /// leaves the live transcript untouched.
-    /// Returns the seconds of audio billed (all tracks summed) for cost tracking,
-    /// 0 when polish didn't run.
-    @discardableResult
-    private func polishTranscript(meeting: Meeting) async -> Double {
+    /// Clean the live transcript's TEXT through Claude — the replacement for
+    /// the old Groq audio re-polish. Segments are updated in place, so every
+    /// timestamp and Me/Them speaker label survives untouched; only the words
+    /// change. Opt-in ("polishAfterCall", the same toggle as before) and
+    /// best-effort: any failure keeps the live transcript. Returns the token
+    /// usage for the cost row, nil when cleanup didn't run.
+    private func cleanTranscript(meeting: Meeting, counterpart: String?) async -> AITokenTotals? {
         guard UserDefaults.standard.bool(forKey: "polishAfterCall"),
-              let key = APIKeyStore.load(account: TranscriptionBackend.groq.keychainAccount!),
-              !key.isEmpty,
-              let modelContext else { return 0 }
+              let key = APIKeyStore.load(), !key.isEmpty,
+              let modelContext else { return nil }
 
-        let setting = UserDefaults.standard.string(forKey: "transcriptionLanguage")
-        let language = (setting == nil || setting == "auto") ? nil : setting
+        let segments = meeting.sortedSegments
+        guard !segments.isEmpty else { return nil }
 
-        do {
-            let polished = try await TranscriptPolisher.polish(
-                systemPath: meeting.systemAudioPath.nilIfEmpty,
-                micPath: meeting.micAudioPath?.nilIfEmpty,
-                language: language,
-                apiKey: key
-            )
-            guard !polished.isEmpty else { return 0 }
-
-            for old in meeting.segments {
-                modelContext.delete(old)
-            }
-            for s in polished {
-                let segment = TranscriptSegment(
-                    startTime: s.start, endTime: s.end,
-                    text: s.text, speakerLabel: s.speaker, confidence: nil)
-                modelContext.insert(segment)
-                segment.meeting = meeting
-            }
-            try? modelContext.save()
-            NSLog("Parrot: transcript polished — \(polished.count) segments")
-            // Billed audio ≈ call duration per re-transcribed track.
-            let tracks = [meeting.systemAudioPath.nilIfEmpty, meeting.micAudioPath?.nilIfEmpty]
-                .compactMap { $0 }.count
-            return meeting.duration * Double(tracks)
-        } catch {
-            NSLog("Parrot: polish failed, keeping live transcript — \(error.localizedDescription)")
-            return 0
+        let lines = segments.map { (speaker: $0.speakerLabel ?? "Them", text: $0.text) }
+        let (cleaned, usage) = await TranscriptCleaner.clean(
+            lines: lines, counterpart: counterpart, apiKey: key)
+        for (index, segment) in segments.enumerated() {
+            if let text = cleaned[index] { segment.text = text }
         }
+        try? modelContext.save()
+        NSLog("Parrot: transcript cleaned — \(cleaned.count)/\(segments.count) lines updated")
+        return usage.calls > 0 ? usage : nil
     }
 
     // MARK: - AI usage snapshot
 
-    /// Freezes this call's AI usage (copilot tokens + transcription/polish audio
-    /// seconds) onto the meeting so the detail view can show what it cost.
-    private func writeAIUsage(meeting: Meeting, polishSeconds: Double,
+    /// Freezes this call's AI usage (report tokens + transcription audio
+    /// seconds + cleanup tokens) onto the meeting so the detail view can show
+    /// what it cost.
+    private func writeAIUsage(meeting: Meeting, cleaning: AITokenTotals? = nil,
                               backendOverride: TranscriptionBackend? = nil) {
         var usage = AIUsage()
         // ponytail: reads the copilot provider/model at stop time, same accepted
@@ -598,7 +577,10 @@ final class RecordingManager {
         usage.transcriptionBackend = (backendOverride ?? TranscriptionBackend.selected).rawValue
         usage.transcriptionSeconds = meeting.duration
         usage.transcriptionTracks = meeting.micAudioPath?.nilIfEmpty != nil ? 2 : 1
-        usage.polishSeconds = polishSeconds
+        if let cleaning {
+            usage.cleaning = cleaning
+            usage.cleaningModel = TranscriptCleaner.model
+        }
         meeting.aiUsageData = try? JSONEncoder().encode(usage)
         try? modelContext?.save()
     }
@@ -611,6 +593,14 @@ final class RecordingManager {
         // instead of the misleading "no report was generated".
         guard let audioPath = meeting.systemAudioPath.nilIfEmpty,
               FileManager.default.fileExists(atPath: audioPath) else { return }
+
+        // Live recordings with a mic track already carry the strongest speaker
+        // split there is: "Me" came from the microphone, "Them" from system
+        // audio — two physically separate streams. The energy-based diarizer
+        // below is a placeholder that alternates "Speaker 1/2" labels, which
+        // would DEGRADE that ground-truth split. Only single-track audio
+        // (file imports, mic-less recordings) has anything to gain from it.
+        guard meeting.micAudioPath?.nilIfEmpty == nil else { return }
 
         do {
             let audioURL = URL(fileURLWithPath: audioPath)

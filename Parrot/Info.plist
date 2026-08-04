@@ -26,6 +26,8 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Parrot reads your calendar to find who a recorded meeting was with, so the cleaned transcript and report can use their real name.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Parrot records your microphone so it can transcribe your side of the meeting on-device.</string>
 	<key>NSScreenCaptureUsageDescription</key>

@@ -50,7 +50,9 @@ final class UpdateChecker {
         }
 
         var request = URLRequest(
-            url: URL(string: "https://api.github.com/repos/turantekin/Parrot/releases?per_page=5")!)
+            // This build tracks the kushthakker fork — never offer upstream
+            // releases, which would replace the optimized build.
+            url: URL(string: "https://api.github.com/repos/kushthakker/Parrot/releases?per_page=5")!)
         request.timeoutInterval = 10
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase

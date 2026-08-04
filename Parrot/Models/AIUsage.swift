@@ -46,8 +46,14 @@ struct AIUsage: Codable {
     /// Billable audio tracks (mic + system = 2; 1 when the mic never recorded).
     var transcriptionTracks = 2
     /// Post-call Groq polish: seconds of audio re-transcribed, all tracks
-    /// summed. 0 when polish didn't run.
+    /// summed. 0 when polish didn't run. Kept for meetings recorded before
+    /// polish was replaced by the Claude text cleanup below.
     var polishSeconds: Double = 0
+
+    /// Post-call Claude transcript cleanup (text in, text out) — nil on
+    /// meetings where cleanup didn't run and on pre-cleanup recordings.
+    var cleaningModel: String?
+    var cleaning: AITokenTotals?
 
     struct LineItem: Equatable {
         let label: String
@@ -70,6 +76,12 @@ struct AIUsage: Codable {
             items.append(Self.modelLine(
                 prefix: "Reports",
                 model: reportsModel ?? "", provider: reportsProvider, totals: reports))
+        }
+        // Post-call transcript cleanup (Claude; provider nil = Claude pricing).
+        if let cleaning, cleaning.calls > 0 {
+            items.append(Self.modelLine(
+                prefix: "Cleanup",
+                model: cleaningModel ?? "", provider: nil, totals: cleaning))
         }
         let backend = TranscriptionBackend(rawValue: transcriptionBackend) ?? .local
         let billedSeconds = transcriptionSeconds * Double(transcriptionTracks)

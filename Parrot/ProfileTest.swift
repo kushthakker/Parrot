@@ -35,8 +35,77 @@ enum ProfileTest {
         testModelFolderMatch()
         testSegmenter()
         testCopilotBudget()
+        testTranscriptCleaner()
+        testAutoRecorderHelpers()
+        testCalendarBestMatch()
         print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
         exit(failures == 0 ? 0 : 1)
+    }
+
+    static func testTranscriptCleaner() {
+        // Numbering carries global indexes through a mid-array slice.
+        let lines = [(speaker: "Me", text: "hello"), (speaker: "Them", text: "hi there"),
+                     (speaker: "Me", text: "bye")]
+        let numbered = TranscriptCleaner.numberedLines(lines[1...])
+        check("cleaner numbering keeps global indexes",
+              numbered == "1 | Them | hi there\n2 | Me | bye")
+
+        // Valid payload maps back by index; unknown indexes are dropped.
+        let originals = [0: "helo world", 1: "fine thanks"]
+        let good = #"{"lines":[{"i":0,"text":"Hello, world."},{"i":1,"text":"Fine, thanks."},{"i":9,"text":"ghost"}]}"#
+        let accepted = TranscriptCleaner.acceptedLines(fromJSON: good, originals: originals)
+        check("cleaner accepts mapped lines", accepted[0] == "Hello, world.")
+        check("cleaner drops unknown index", accepted[9] == nil)
+
+        // A line the model shrank to nothing or ballooned is rejected —
+        // cleanup never summarizes or pads.
+        let bad = #"{"lines":[{"i":0,"text":"x"},{"i":1,"text":"\#(String(repeating: "pad ", count: 40))"}]}"#
+        let guarded = TranscriptCleaner.acceptedLines(fromJSON: bad, originals: originals)
+        check("cleaner rejects over-shrunk line", guarded[0] == nil)
+        check("cleaner rejects over-grown line", guarded[1] == nil)
+
+        // Malformed JSON keeps the originals rather than corrupting anything.
+        check("cleaner survives malformed JSON",
+              TranscriptCleaner.acceptedLines(fromJSON: "not json", originals: originals).isEmpty)
+
+        // The user's cleanup brief carries the calendar name when known.
+        check("cleaner prompt names the counterpart",
+              TranscriptCleaner.systemPrompt(counterpart: "Puneet").contains("call with Puneet"))
+        check("cleaner prompt has a generic fallback",
+              TranscriptCleaner.systemPrompt(counterpart: nil).contains("another person"))
+    }
+
+    static func testAutoRecorderHelpers() {
+        check("meet link found in location",
+              MeetingAutoRecorder.containsMeetLink(
+                  title: "Sync", location: "https://meet.google.com/abc-defg-hij",
+                  notes: nil, urlString: nil))
+        check("meet link found in notes",
+              MeetingAutoRecorder.containsMeetLink(
+                  title: nil, location: nil,
+                  notes: "Join: https://MEET.GOOGLE.COM/xyz", urlString: nil))
+        check("no meet link means no match",
+              !MeetingAutoRecorder.containsMeetLink(
+                  title: "Lunch", location: "Cafe", notes: "no link here", urlString: "https://zoom.us/j/1"))
+        let day1 = Date(timeIntervalSince1970: 1_700_000_000)
+        let day2 = day1.addingTimeInterval(86_400)
+        check("recurring occurrences key separately",
+              MeetingAutoRecorder.occurrenceKey(identifier: "evt", start: day1)
+                  != MeetingAutoRecorder.occurrenceKey(identifier: "evt", start: day2))
+    }
+
+    static func testCalendarBestMatch() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let recStart = base, recEnd = base.addingTimeInterval(1800)
+        let events = [
+            (start: base.addingTimeInterval(-3600), end: base.addingTimeInterval(-1800)),  // before
+            (start: base.addingTimeInterval(-300), end: base.addingTimeInterval(1500)),    // big overlap
+            (start: base.addingTimeInterval(1700), end: base.addingTimeInterval(3600)),    // tail overlap
+        ]
+        check("calendar picks the biggest overlap",
+              CalendarLookup.bestMatch(events: events, recordingStart: recStart, recordingEnd: recEnd) == 1)
+        check("calendar returns nil with no overlap",
+              CalendarLookup.bestMatch(events: [events[0]], recordingStart: recStart, recordingEnd: recEnd) == nil)
     }
 
     static func testKindStyleFallback() {

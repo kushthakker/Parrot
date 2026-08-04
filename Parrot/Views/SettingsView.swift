@@ -65,6 +65,7 @@ struct SettingsView: View {
     @AppStorage("echoCancellationEnabled") private var echoCancellation = true
     @AppStorage(TranscriptionBackend.defaultsKey) private var transcriptionBackend = TranscriptionBackend.local.rawValue
     @AppStorage("polishAfterCall") private var polishAfterCall = false
+    @AppStorage(MeetingAutoRecorder.enabledKey) private var autoRecordMeetings = true
     @State private var section: SettingsSection = .general
     @State private var showFileImporter = false
     /// There's no Save button — @AppStorage persists on every change. This
@@ -228,8 +229,13 @@ struct SettingsView: View {
 
                 Divider()
 
-                Toggle("Polish transcript after each call", isOn: $polishAfterCall)
-                Hint("Re-transcribes the saved audio with a large Groq model (~$0.04/hr) and regenerates the report.")
+                Toggle("Clean transcript after each call", isOn: $polishAfterCall)
+                Hint("After the call, Claude fixes misheard words and punctuation in the transcript text — timestamps and Me/Them labels stay untouched. Uses your Claude API key; the report is written from the cleaned text.")
+
+                Divider()
+
+                Toggle("Record Google Meet meetings automatically", isOn: $autoRecordMeetings)
+                Hint("Watches your calendar and starts recording when an event with a Google Meet link begins — no button press. Stops once the meeting is over and the room goes quiet. Needs Calendar access; your Google account must be added in System Settings → Internet Accounts.")
             }
 
             Section("On-Device Model") {
