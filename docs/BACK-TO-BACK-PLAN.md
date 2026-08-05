@@ -359,10 +359,12 @@ future option if titles ever prove insufficient.)
 
 **In `MeetingAutoRecorder`:**
 
-- Fetch titles at most once per tick, and **only when a split decision is
-  pending** (recording + `next` exists):
-  `SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)`
-  → `windows.compactMap(\.title)`.
+- Fetch titles at most once per tick while an auto-recording is active:
+  `SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)`.
+  Use on-screen titles for back-to-back matching, but all window titles for
+  initial Meet discovery. Track the discovered macOS window ID afterward, so
+  changing browser tabs, minimizing, or changing Spaces cannot stop a call;
+  the observed window itself must disappear.
 - Pure matcher (harness-tested):
 
 ```swift
@@ -370,13 +372,23 @@ enum TitleSignal { case showsCurrent, showsNext, unknown }
 static func titleSignal(windowTitles: [String], currentTitle: String?, nextTitle: String?) -> TitleSignal
 ```
 
-Rules: consider only titles that look like a Meet surface (case-insensitive
-contains "meet"); a candidate matches when the window title contains the event
-title (trimmed, ≥ 4 chars — refuse trivial/empty matches); `showsNext` wins over
-`showsCurrent` if both somehow match; anything else → `.unknown`. `.unknown`
-must degrade to exactly Stage 1 behavior — the calendar+quiet rule carries the
-decision. (Known blind spot, by design: a backgrounded Meet tab has no window
-title; that's why this layer refines and never replaces the calendar layer.)
+Rules: consider only canonical Meet surfaces (`Google Meet` as a token, or a
+leading `Meet` followed by a title separator); a candidate matches when the
+window title contains the event title (trimmed, ≥ 4 chars — refuse trivial/empty
+matches); `showsNext` wins over `showsCurrent` if both somehow match; anything
+else → `.unknown`. `.unknown`
+must degrade to the calendar+quiet rule for split decisions.
+
+For a single meeting, once Parrot has successfully observed a Meet window, a
+successful window snapshot with no Meet title starts an early-leave clock. If
+the window remains absent and speech remains absent for 90 seconds, stop and
+process without waiting for the calendar event to end. A failed window query is
+unknown and breaks the continuous-absence clock; an adjacent successor starting
+within five minutes disables this rule so back-to-back handoff remains
+authoritative. The identity signal and grace period avoid background-tab false
+positives without adding Accessibility. This intentionally cannot detect closing
+or navigating away from a Meet tab while the same browser OS window survives;
+that conservative false-negative is preferable to stopping a quiet live call.
 
 Wire the result into `SplitInputs.titleSignal`. This is what resolves the two
 ambiguous cases: A overrunning into B's slot (title still shows A → hold) and

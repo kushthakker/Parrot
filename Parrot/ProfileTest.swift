@@ -180,6 +180,47 @@ enum ProfileTest {
               MeetingAutoRecorder.titleSignal(
                 windowTitles: ["Product Review — Notes"],
                 currentTitle: nil, nextTitle: "Product Review") == .unknown)
+        check("auto-stop recognizes a visible Meet window",
+              MeetingAutoRecorder.hasMeetWindow(["Google Meet — Weekly Sync"]))
+        check("auto-stop ignores ordinary browser windows",
+              !MeetingAutoRecorder.hasMeetWindow(["Calendar — Google Chrome"]))
+        check("auto-stop rejects Meeting substring",
+              !MeetingAutoRecorder.hasMeetWindow(["Meeting notes — Google Chrome"]))
+        check("auto-stop rejects Meetup substring",
+              !MeetingAutoRecorder.hasMeetWindow(["Meetup — Google Chrome"]))
+        check("auto-stop rejects generic Meet agenda",
+              !MeetingAutoRecorder.hasMeetWindow(["Meet agenda — Notes"]))
+        check("auto-stop rejects meet summary suffix",
+              !MeetingAutoRecorder.hasMeetWindow(["Board notes — meet summary"]))
+        check("auto-stop fires after Meet disappears and room stays quiet",
+              MeetingAutoRecorder.shouldStopAfterLeaving(
+                sawMeetWindow: true, windowMissingFor: 90,
+                quietFor: 90, hasNextMeeting: false))
+        check("auto-stop requires prior Meet-window proof",
+              !MeetingAutoRecorder.shouldStopAfterLeaving(
+                sawMeetWindow: false, windowMissingFor: 120,
+                quietFor: 120, hasNextMeeting: false))
+        check("auto-stop waits through brief window disappearance",
+              !MeetingAutoRecorder.shouldStopAfterLeaving(
+                sawMeetWindow: true, windowMissingFor: 89,
+                quietFor: 120, hasNextMeeting: false))
+        check("auto-stop waits while speech continues",
+              !MeetingAutoRecorder.shouldStopAfterLeaving(
+                sawMeetWindow: true, windowMissingFor: 120,
+                quietFor: 89, hasNextMeeting: false))
+        check("auto-stop defers to back-to-back handoff",
+              !MeetingAutoRecorder.shouldStopAfterLeaving(
+                sawMeetWindow: true, windowMissingFor: 120,
+                quietFor: 120, hasNextMeeting: true))
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let scheduledEnd = now.addingTimeInterval(300)
+        check("auto-stop protects successor five minutes away",
+              MeetingAutoRecorder.isProtectedSuccessor(
+                start: scheduledEnd, currentEnd: scheduledEnd, now: now))
+        check("auto-stop ignores non-adjacent future meeting",
+              !MeetingAutoRecorder.isProtectedSuccessor(
+                start: now.addingTimeInterval(240),
+                currentEnd: now.addingTimeInterval(1_800), now: now))
     }
 
     static func testAutoRecorderTransition() {

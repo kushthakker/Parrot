@@ -25,6 +25,14 @@ final class MeetingAutoRecorder {
     /// After the last Meet event ends, stop once the room has been quiet this
     /// long — speech keeps the recording alive however long the call overruns.
     static let quietStopAfter: TimeInterval = 240
+    /// If a Meet window was visible during this auto-recording and then stays
+    /// gone, stop sooner once speech is also absent. Requiring both signals
+    /// avoids treating a quiet room or a transient window-list failure alone
+    /// as proof that the user left the call.
+    nonisolated static let leftCallQuietStopAfter: TimeInterval = 90
+    /// Keep an imminent successor on the uninterrupted handoff path. Longer
+    /// gaps can stop safely and let normal calendar auto-start resume later.
+    nonisolated static let successorLookahead: TimeInterval = 5 * 60
     /// Backstop: never keep recording longer than this past the last Meet
     /// event's end, speech or not (screenshare audio, music, a forgotten tab).
     static let overrunHardCap: TimeInterval = 45 * 60
@@ -50,6 +58,9 @@ final class MeetingAutoRecorder {
     private var ongoingKeysAtLastRecordingTick: Set<String> = []
     private var suppressNextTransitionMark = false
     private var handoffFailures: [String: Int] = [:]
+    private var hasSeenMeetWindow = false
+    private var observedMeetWindowIDs: Set<CGWindowID> = []
+    private var meetWindowMissingSince: Date?
 
     var isManagingCurrentRecording: Bool { autoEvent != nil }
 
@@ -86,16 +97,18 @@ final class MeetingAutoRecorder {
         // Events overlapping "now": window reaches back for long meetings.
         let predicate = store.predicateForEvents(
             withStart: now.addingTimeInterval(-4 * 3600),
-            end: now.addingTimeInterval(60),
+            end: now.addingTimeInterval(Self.successorLookahead),
             calendars: nil
         )
-        let ongoingMeet = store.events(matching: predicate).filter { event in
+        let meetEvents = store.events(matching: predicate).filter { event in
             guard !event.isAllDay, let start = event.startDate, let end = event.endDate,
-                  start <= now, end > now else { return false }
+                  start <= now.addingTimeInterval(Self.successorLookahead),
+                  end > now else { return false }
             return Self.containsMeetLink(
                 title: event.title, location: event.location,
                 notes: event.notes, urlString: event.url?.absoluteString)
         }
+        let ongoingMeet = meetEvents.filter { ($0.startDate ?? .distantFuture) <= now }
 
         let ongoingKeys = Set(ongoingMeet.map(Self.occurrenceKey))
         let recordingNow = manager.isRecording && !manager.isStopping
@@ -107,9 +120,17 @@ final class MeetingAutoRecorder {
         )
         if !transition.handled.isEmpty { handledOccurrences.formUnion(transition.handled) }
         suppressNextTransitionMark = transition.suppressAfter
-        if wasRecordingLastTick && !recordingNow { autoEvent = nil }
+        if wasRecordingLastTick && !recordingNow {
+            autoEvent = nil
+            hasSeenMeetWindow = false
+            observedMeetWindowIDs = []
+            meetWindowMissingSince = nil
+        }
         if recordingNow { ongoingKeysAtLastRecordingTick = ongoingKeys }
-        defer { wasRecordingLastTick = manager.isRecording && !manager.isStopping }
+        // Preserve the state sampled before any await. If the user presses Stop
+        // while a ScreenCaptureKit query is suspended, the next tick must still
+        // observe the true → false transition and mark the covered occurrence.
+        defer { wasRecordingLastTick = recordingNow }
 
         // While recording, keep the speech clock fresh from the live audio
         // levels and the committed transcript — either stream counts.
@@ -142,19 +163,62 @@ final class MeetingAutoRecorder {
                 autoEvent = current
             }
 
-            let next = ongoingMeet
+            let pendingNext = meetEvents
                 .filter {
                     let key = Self.occurrenceKey($0)
                     return key != current.key && !handledOccurrences.contains(key)
+                        && Self.isProtectedSuccessor(
+                            start: $0.startDate, currentEnd: current.end, now: now)
                 }
                 .min { ($0.startDate ?? .distantFuture) < ($1.startDate ?? .distantFuture) }
+            let next = pendingNext.flatMap {
+                ($0.startDate ?? .distantFuture) <= now ? $0 : nil
+            }
+
+            // ScreenCaptureKit is already authorized for system-audio capture.
+            // A failed query is unknown, not "window missing"; only a successful
+            // window snapshot may advance or reset the early-stop clock.
+            let activeMeetingID = manager.currentMeeting?.id
+            let content = try? await SCShareableContent.excludingDesktopWindows(
+                true, onScreenWindowsOnly: false)
+            guard manager.isRecording, !manager.isStopping,
+                  manager.currentMeeting?.id == activeMeetingID,
+                  autoEvent?.key == current.key else {
+                if manager.currentMeeting?.id != activeMeetingID {
+                    autoEvent = nil
+                    hasSeenMeetWindow = false
+                    observedMeetWindowIDs = []
+                    meetWindowMissingSince = nil
+                }
+                return
+            }
+            let onScreenWindowTitles = content?.windows
+                .filter(\.isOnScreen).compactMap(\.title) ?? []
+            let meetWindows = content?.windows.filter {
+                $0.title.map(Self.isMeetWindowTitle) ?? false
+            } ?? []
+            if content != nil {
+                if !meetWindows.isEmpty {
+                    hasSeenMeetWindow = true
+                    observedMeetWindowIDs.formUnion(meetWindows.map(\.windowID))
+                }
+                let existingWindowIDs = Set(content?.windows.map(\.windowID) ?? [])
+                if !observedMeetWindowIDs.isDisjoint(with: existingWindowIDs) {
+                    meetWindowMissingSince = nil
+                } else if hasSeenMeetWindow {
+                    meetWindowMissingSince = meetWindowMissingSince ?? now
+                }
+            } else {
+                // Unknown breaks the continuous-absence proof. Keep the fact
+                // that Meet was seen, but require a fresh 90-second run.
+                meetWindowMissingSince = nil
+            }
+
             if let next,
                let nowElapsed = manager.captureElapsed,
                let recordingStart = manager.currentSpanStartElapsed {
-                let content = try? await SCShareableContent.excludingDesktopWindows(
-                    true, onScreenWindowsOnly: true)
                 let signal = Self.titleSignal(
-                    windowTitles: content?.windows.compactMap(\.title) ?? [],
+                    windowTitles: onScreenWindowTitles,
                     currentTitle: current.title,
                     nextTitle: next.title
                 )
@@ -185,6 +249,10 @@ final class MeetingAutoRecorder {
                             handledOccurrences.insert(key)
                             handoffFailures[key] = nil
                             lastSpeechAt = now
+                            observedMeetWindowIDs = signal == .showsNext
+                                ? Set(meetWindows.map(\.windowID)) : []
+                            hasSeenMeetWindow = !observedMeetWindowIDs.isEmpty
+                            meetWindowMissingSince = nil
                             manager.markAutoStarted(meeting)
                             NSLog("Parrot: handed off recording to \"\(next.title ?? "meeting")\"")
                             return
@@ -202,6 +270,22 @@ final class MeetingAutoRecorder {
                 }
             }
 
+            if Self.shouldStopAfterLeaving(
+                   sawMeetWindow: hasSeenMeetWindow,
+                   windowMissingFor: meetWindowMissingSince.map { now.timeIntervalSince($0) },
+                   quietFor: now.timeIntervalSince(lastSpeechAt),
+                   hasNextMeeting: pendingNext != nil
+               ) {
+                autoEvent = nil
+                meetEndedAt = nil
+                hasSeenMeetWindow = false
+                observedMeetWindowIDs = []
+                meetWindowMissingSince = nil
+                NSLog("Parrot: auto-stopping — Meet window gone and room quiet")
+                await manager.stopRecording()
+                return
+            }
+
             if !ongoingMeet.isEmpty {
                 meetEndedAt = nil
                 return
@@ -213,6 +297,9 @@ final class MeetingAutoRecorder {
             if quiet || capped {
                 autoEvent = nil
                 meetEndedAt = nil
+                hasSeenMeetWindow = false
+                observedMeetWindowIDs = []
+                meetWindowMissingSince = nil
                 NSLog("Parrot: auto-stopping — Meet event over, \(quiet ? "room quiet" : "overrun cap")")
                 await manager.stopRecording()
             }
@@ -236,6 +323,9 @@ final class MeetingAutoRecorder {
             autoEvent = (key, event.endDate, event.title)
             meetEndedAt = nil
             lastSpeechAt = now
+            hasSeenMeetWindow = false
+            observedMeetWindowIDs = []
+            meetWindowMissingSince = nil
             manager.markAutoStarted(manager.currentMeeting)
             // Name the meeting after the invite so the sidebar reads like a
             // calendar, not "Meeting at 14:03".
@@ -347,9 +437,7 @@ final class MeetingAutoRecorder {
         currentTitle: String?,
         nextTitle: String?
     ) -> TitleSignal {
-        let meetTitles = windowTitles.filter {
-            $0.range(of: "meet", options: .caseInsensitive) != nil
-        }
+        let meetTitles = windowTitles.filter(isMeetWindowTitle)
         func matches(_ candidate: String?) -> Bool {
             guard let candidate = candidate?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -361,6 +449,38 @@ final class MeetingAutoRecorder {
         if matches(nextTitle) { return .showsNext }
         if matches(currentTitle) { return .showsCurrent }
         return .unknown
+    }
+
+    nonisolated static func hasMeetWindow(_ windowTitles: [String]) -> Bool {
+        windowTitles.contains(where: isMeetWindowTitle)
+    }
+
+    nonisolated static func isMeetWindowTitle(_ title: String) -> Bool {
+        title.range(
+            of: #"(?:\bgoogle\s+meet\b|^\s*meet\s*[-–—|:])"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+    }
+
+    nonisolated static func isProtectedSuccessor(
+        start: Date?, currentEnd: Date, now: Date
+    ) -> Bool {
+        guard let start else { return false }
+        if start <= now { return true }
+        return start.timeIntervalSince(now) <= successorLookahead
+            && abs(start.timeIntervalSince(currentEnd)) <= 60
+    }
+
+    nonisolated static func shouldStopAfterLeaving(
+        sawMeetWindow: Bool,
+        windowMissingFor: TimeInterval?,
+        quietFor: TimeInterval,
+        hasNextMeeting: Bool
+    ) -> Bool {
+        guard sawMeetWindow, !hasNextMeeting,
+              let windowMissingFor else { return false }
+        return windowMissingFor >= leftCallQuietStopAfter
+            && quietFor >= leftCallQuietStopAfter
     }
 
     nonisolated static func transitionMark(

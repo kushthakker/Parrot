@@ -10,3 +10,5 @@
 - Gap search must include leading decoded silence; otherwise a silent A followed by speaking B has no detectable switch gap.
 - Provisional refinement in A→B→C must ignore gaps before B's span start, or a rapid third handoff can reuse the A→B gap.
 - Rotated audio paths must be unique beyond second resolution; reusing the active URL can reopen `AVAudioFile(forWriting:)` and truncate the finished recording.
+- Early leave detection must track the observed macOS window ID, not its changing browser-tab title; successful continuous window absence plus audio quiet is required, failed ScreenCaptureKit queries break the proof, awaited queries preserve pre-await transition state, and adjacent successors block single-call stopping.
+- Without Accessibility or browser Automation, a closed Meet tab inside a surviving browser window is indistinguishable from a backgrounded live call; accept that false-negative rather than auto-stopping a quiet call.
