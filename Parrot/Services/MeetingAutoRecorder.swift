@@ -1,5 +1,6 @@
 import EventKit
 import Foundation
+import ScreenCaptureKit
 import SwiftData
 
 /// Hands-free recording: watches the user's calendar and starts a recording
@@ -38,17 +39,24 @@ final class MeetingAutoRecorder {
     private var handledOccurrences: Set<String> = []
     /// Non-nil while a recording THIS scheduler started is running; manual
     /// recordings are never auto-stopped.
-    private var autoOccurrenceKey: String?
+    private var autoEvent: (key: String, end: Date, title: String?)?
     private var lastSpeechAt = Date()
     /// First tick at which no Meet event was ongoing anymore (drives the cap).
     private var meetEndedAt: Date?
     /// Ticks await (calendar ask, start/stop recording) long enough for the
     /// next timer fire to interleave on the main actor — one tick at a time.
     private var tickInFlight = false
+    private var wasRecordingLastTick = false
+    private var ongoingKeysAtLastRecordingTick: Set<String> = []
+    private var suppressNextTransitionMark = false
+    private var handoffFailures: [String: Int] = [:]
+
+    var isManagingCurrentRecording: Bool { autoEvent != nil }
 
     func start(recordingManager: RecordingManager, modelContext: ModelContext) {
         self.recordingManager = recordingManager
         self.modelContext = modelContext
+        wasRecordingLastTick = recordingManager.isRecording
         timer?.invalidate()
         let timer = Timer(timeInterval: 20, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.tick() }
@@ -89,33 +97,111 @@ final class MeetingAutoRecorder {
                 notes: event.notes, urlString: event.url?.absoluteString)
         }
 
+        let ongoingKeys = Set(ongoingMeet.map(Self.occurrenceKey))
+        let recordingNow = manager.isRecording && !manager.isStopping
+        let transition = Self.transitionMark(
+            wasRecording: wasRecordingLastTick,
+            isRecording: recordingNow,
+            suppress: suppressNextTransitionMark,
+            ongoingAtLastRecordingTick: ongoingKeysAtLastRecordingTick
+        )
+        if !transition.handled.isEmpty { handledOccurrences.formUnion(transition.handled) }
+        suppressNextTransitionMark = transition.suppressAfter
+        if wasRecordingLastTick && !recordingNow { autoEvent = nil }
+        if recordingNow { ongoingKeysAtLastRecordingTick = ongoingKeys }
+        defer { wasRecordingLastTick = manager.isRecording && !manager.isStopping }
+
         // While recording, keep the speech clock fresh from the live audio
-        // levels and the committed transcript — either stream counts. Any
-        // running recording (manual or auto) also counts as covering the
-        // ongoing Meet events: mark them handled so stopping it isn't
-        // answered with an auto-restart for the same meeting.
+        // levels and the committed transcript — either stream counts.
         if manager.isRecording {
             if manager.audioCaptureManager.audioLevel > 0.003
                 || manager.audioCaptureManager.micLevel > 0.003 {
                 lastSpeechAt = now
             }
-            if let start = manager.recordingStartTime,
-               let lastSegmentEnd = manager.currentMeeting?.segments.map(\.endTime).max() {
-                lastSpeechAt = max(lastSpeechAt, start.addingTimeInterval(lastSegmentEnd))
+            if let nowElapsed = manager.captureElapsed,
+               let lastSegmentEnd = manager.recordedSpeechIntervals().map(\.upperBound).max() {
+                lastSpeechAt = max(lastSpeechAt,
+                                   now.addingTimeInterval(lastSegmentEnd - nowElapsed))
             }
-            for event in ongoingMeet { handledOccurrences.insert(Self.occurrenceKey(event)) }
         }
 
-        // The user pressed Stop on an auto-started recording: respect it —
-        // mark everything currently ongoing as handled so it doesn't restart.
-        if !manager.isRecording, autoOccurrenceKey != nil {
-            autoOccurrenceKey = nil
-            for event in ongoingMeet { handledOccurrences.insert(Self.occurrenceKey(event)) }
-        }
+        // A normal Stop keeps isRecording true while Whisper drains. It is not
+        // a handoff candidate, and retrying B during that window could exhaust
+        // the three-attempt guard before the engine is available again.
+        if manager.isStopping { return }
 
         if manager.isRecording {
             // Auto-stop applies only to recordings this scheduler started.
-            guard autoOccurrenceKey != nil else { return }
+            guard var current = autoEvent else { return }
+
+            if let refreshed = ongoingMeet.first(where: {
+                Self.occurrenceKey($0) == current.key
+            }) {
+                current.end = refreshed.endDate
+                current.title = refreshed.title
+                autoEvent = current
+            }
+
+            let next = ongoingMeet
+                .filter {
+                    let key = Self.occurrenceKey($0)
+                    return key != current.key && !handledOccurrences.contains(key)
+                }
+                .min { ($0.startDate ?? .distantFuture) < ($1.startDate ?? .distantFuture) }
+            if let next,
+               let nowElapsed = manager.captureElapsed,
+               let recordingStart = manager.currentSpanStartElapsed {
+                let content = try? await SCShareableContent.excludingDesktopWindows(
+                    true, onScreenWindowsOnly: true)
+                let signal = Self.titleSignal(
+                    windowTitles: content?.windows.compactMap(\.title) ?? [],
+                    currentTitle: current.title,
+                    nextTitle: next.title
+                )
+                let speech = manager.recordedSpeechIntervals()
+                let horizon = manager.transcriptionEngine.isStreaming
+                    ? nowElapsed : manager.decodedThrough
+                let inputs = SplitInputs(
+                    now: nowElapsed,
+                    horizon: horizon,
+                    recordingStart: recordingStart,
+                    currentEnd: nowElapsed + current.end.timeIntervalSince(now),
+                    nextStart: nowElapsed + (next.startDate ?? now).timeIntervalSince(now),
+                    speech: speech,
+                    lastSpeechAt: nowElapsed - now.timeIntervalSince(lastSpeechAt),
+                    titleSignal: signal
+                )
+                let decision = Self.splitDecision(inputs)
+                if decision.fire, let boundary = decision.boundary {
+                    let key = Self.occurrenceKey(next)
+                    do {
+                        if let meeting = try await manager.handoffRecording(
+                            modelContext: modelContext,
+                            title: next.title?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                            boundaryElapsed: boundary,
+                            provisional: decision.provisional
+                        ) {
+                            autoEvent = (key, next.endDate, next.title)
+                            handledOccurrences.insert(key)
+                            handoffFailures[key] = nil
+                            lastSpeechAt = now
+                            manager.markAutoStarted(meeting)
+                            NSLog("Parrot: handed off recording to \"\(next.title ?? "meeting")\"")
+                            return
+                        }
+                    } catch {
+                        NSLog("Parrot: handoff failed — \(error.localizedDescription)")
+                    }
+                    let failures = (handoffFailures[key] ?? 0) + 1
+                    handoffFailures[key] = failures
+                    if failures >= 3 {
+                        handledOccurrences.insert(key)
+                        handoffFailures[key] = nil
+                        NSLog("Parrot: handoff gave up after 3 attempts for \"\(next.title ?? "meeting")\"")
+                    }
+                }
+            }
+
             if !ongoingMeet.isEmpty {
                 meetEndedAt = nil
                 return
@@ -125,7 +211,7 @@ final class MeetingAutoRecorder {
             let quiet = now.timeIntervalSince(lastSpeechAt) > Self.quietStopAfter
             let capped = now.timeIntervalSince(endedAt) > Self.overrunHardCap
             if quiet || capped {
-                autoOccurrenceKey = nil
+                autoEvent = nil
                 meetEndedAt = nil
                 NSLog("Parrot: auto-stopping — Meet event over, \(quiet ? "room quiet" : "overrun cap")")
                 await manager.stopRecording()
@@ -138,17 +224,19 @@ final class MeetingAutoRecorder {
         // never surprise the user with an OS prompt mid-meeting.
         guard !manager.isStopping, manager.transcriptionEngine.isReady,
               CGPreflightScreenCaptureAccess() else { return }
-        guard let event = ongoingMeet.first(where: {
-            !handledOccurrences.contains(Self.occurrenceKey($0))
-        }) else { return }
+        guard let event = ongoingMeet
+            .filter({ !handledOccurrences.contains(Self.occurrenceKey($0)) })
+            .min(by: { ($0.startDate ?? .distantFuture) < ($1.startDate ?? .distantFuture) })
+        else { return }
 
         let key = Self.occurrenceKey(event)
         handledOccurrences.insert(key)
         do {
             try await manager.startRecording(modelContext: modelContext)
-            autoOccurrenceKey = key
+            autoEvent = (key, event.endDate, event.title)
             meetEndedAt = nil
             lastSpeechAt = now
+            manager.markAutoStarted(manager.currentMeeting)
             // Name the meeting after the invite so the sidebar reads like a
             // calendar, not "Meeting at 14:03".
             if let title = event.title?.trimmingCharacters(in: .whitespaces).nilIfEmpty {
@@ -162,6 +250,131 @@ final class MeetingAutoRecorder {
     }
 
     // MARK: - Pure helpers (harness-tested)
+
+    enum TitleSignal: Equatable {
+        case showsCurrent, showsNext, unknown
+    }
+
+    struct SplitInputs {
+        var now: TimeInterval
+        var horizon: TimeInterval
+        var recordingStart: TimeInterval
+        var currentEnd: TimeInterval
+        var nextStart: TimeInterval
+        var speech: [ClosedRange<TimeInterval>]
+        var lastSpeechAt: TimeInterval
+        var titleSignal: TitleSignal
+    }
+
+    struct SplitDecision {
+        var fire: Bool
+        var boundary: TimeInterval?
+        var provisional: Bool
+    }
+
+    /// First credible decoded silence of at least 30 seconds in the search
+    /// window. `horizon` is a completed-decode watermark, never wall clock, so
+    /// undecoded audio cannot masquerade as trailing silence.
+    nonisolated static func splitGap(_ input: SplitInputs) -> ClosedRange<TimeInterval>? {
+        let floor = max(input.recordingStart, input.nextStart - 600)
+        guard input.horizon > floor else { return nil }
+        let clipped = input.speech.compactMap { interval -> ClosedRange<TimeInterval>? in
+            let lower = max(floor, interval.lowerBound)
+            let upper = min(input.horizon, interval.upperBound)
+            return upper >= lower ? lower...upper : nil
+        }.sorted { $0.lowerBound < $1.lowerBound }
+        guard var previous = clipped.first else {
+            return input.horizon - floor >= 30 ? floor...input.horizon : nil
+        }
+        var gaps: [ClosedRange<TimeInterval>] = []
+        if previous.lowerBound - floor >= 30 {
+            gaps.append(floor...previous.lowerBound)
+        }
+        for interval in clipped.dropFirst() {
+            if interval.lowerBound <= previous.upperBound {
+                previous = previous.lowerBound...max(previous.upperBound, interval.upperBound)
+            } else {
+                if interval.lowerBound - previous.upperBound >= 30 {
+                    gaps.append(previous.upperBound...interval.lowerBound)
+                }
+                previous = interval
+            }
+        }
+        if input.horizon - previous.upperBound >= 30 {
+            gaps.append(previous.upperBound...input.horizon)
+        }
+        // Do not resurrect an ordinary pause far back inside A merely because
+        // later A speech exists. A credible switch gap must reach to within a
+        // minute of the scheduled boundary (or cross it); early-leave trailing
+        // silence still qualifies because its upper edge reaches the horizon.
+        let boundary = min(input.currentEnd, input.nextStart)
+        return gaps.first { $0.upperBound >= boundary - 60 }
+    }
+
+    nonisolated static func splitDecision(_ input: SplitInputs) -> SplitDecision {
+        let gap = splitGap(input)
+        if input.titleSignal == .showsNext {
+            return SplitDecision(
+                fire: true,
+                boundary: gap.map { $0.lowerBound + 2 } ?? input.now,
+                provisional: gap == nil
+            )
+        }
+        guard input.titleSignal != .showsCurrent, input.now >= input.currentEnd else {
+            return SplitDecision(fire: false, boundary: nil, provisional: false)
+        }
+        if let gap {
+            if input.speech.contains(where: { $0.lowerBound >= gap.lowerBound + 30 }) {
+                return SplitDecision(fire: true, boundary: gap.lowerBound + 2, provisional: false)
+            }
+            if input.lastSpeechAt <= gap.lowerBound + 5,
+               input.now - gap.lowerBound >= 45 {
+                return SplitDecision(fire: true, boundary: gap.lowerBound + 2, provisional: false)
+            }
+        }
+        if input.now >= input.nextStart + 300 {
+            return SplitDecision(
+                fire: true,
+                boundary: gap.map { $0.lowerBound + 2 } ?? input.now,
+                provisional: gap == nil
+            )
+        }
+        return SplitDecision(fire: false, boundary: nil, provisional: false)
+    }
+
+    nonisolated static func titleSignal(
+        windowTitles: [String],
+        currentTitle: String?,
+        nextTitle: String?
+    ) -> TitleSignal {
+        let meetTitles = windowTitles.filter {
+            $0.range(of: "meet", options: .caseInsensitive) != nil
+        }
+        func matches(_ candidate: String?) -> Bool {
+            guard let candidate = candidate?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  candidate.count >= 4 else { return false }
+            return meetTitles.contains {
+                $0.range(of: candidate, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+            }
+        }
+        if matches(nextTitle) { return .showsNext }
+        if matches(currentTitle) { return .showsCurrent }
+        return .unknown
+    }
+
+    nonisolated static func transitionMark(
+        wasRecording: Bool,
+        isRecording: Bool,
+        suppress: Bool,
+        ongoingAtLastRecordingTick: Set<String>
+    ) -> (handled: Set<String>, suppressAfter: Bool) {
+        guard wasRecording, !isRecording else {
+            return ([], suppress)
+        }
+        if suppress { return ([], false) }
+        return (ongoingAtLastRecordingTick, false)
+    }
 
     /// Whether an event carries a Google Meet link anywhere the invite can
     /// put one (Google Calendar surfaces it in location, notes, or the URL).

@@ -36,8 +36,27 @@ final class RecordingManager {
     /// cancel the draining loop and share buffers with the old session. Readable
     /// so the live view can show a "Finalizing…" state.
     private(set) var isStopping = false
+    /// A handoff mutates span/file bookkeeping without stopping either capture
+    /// engine. Mutual exclusion with stop prevents a half-closed final span.
+    private(set) var isHandingOff = false
     private var timer: Timer?
     private var modelContext: ModelContext?
+
+    private struct MeetingSpan {
+        let meeting: Meeting
+        var startElapsed: TimeInterval
+        var endElapsed: TimeInterval?
+    }
+    /// Capture-relative meeting windows for the current uninterrupted audio and
+    /// transcription session. The last span is the meeting shown by the live UI.
+    private var spans: [MeetingSpan] = []
+    private var captureEpoch: Date?
+    private var captureSessionID = UUID()
+    /// Only scheduler-created empty recordings may be discarded at finalize.
+    private var autoStartedMeetingIDs: Set<UUID> = []
+    /// Completed tasks are intentionally retained as the FIFO tail; awaiting a
+    /// completed task is free and avoids a second synchronization abstraction.
+    private var postChainTail: Task<Void, Never>?
 
     /// Non-nil while a file import runs — drives the import banner in the UI.
     private(set) var importProgress: ImportProgress?
@@ -137,15 +156,20 @@ final class RecordingManager {
         // Same chain a clean stop runs: diarization refines speakers and sets .done;
         // the report runs when the copilot is configured. Coaching stays on — a
         // crashed live call still has a real per-segment "Me"/"Them" split.
-        await postProcess(meeting: meeting)
-        if callAnalysisEngine.isEnabled, callAnalysisEngine.provider.isConfigured,
-           meeting.summary == nil {
-            callAnalysisEngine.provider.resetUsage()
-            await generateSummary(meeting: meeting)
+        await runPostChain {
+            guard !meeting.isDeleted else { return }
+            self.callAnalysisEngine.provider.resetUsage()
+            await self.postProcess(meeting: meeting)
+            guard !meeting.isDeleted else { return }
+            if self.callAnalysisEngine.isEnabled, self.callAnalysisEngine.provider.isConfigured,
+               meeting.summary == nil {
+                await self.generateSummary(meeting: meeting)
+            }
+            guard !meeting.isDeleted else { return }
+            self.writeAIUsage(meeting: meeting)
+            meeting.status = .done
+            try? self.modelContext?.save()
         }
-        writeAIUsage(meeting: meeting)
-        meeting.status = .done
-        try? modelContext?.save()
     }
 
     // MARK: - Recording Control
@@ -180,15 +204,16 @@ final class RecordingManager {
         isStarting = true
         defer { isStarting = false }
 
-        // Create meeting
-        let meeting = Meeting()
-        modelContext.insert(meeting)
-
-        // Persist active profile/brief/snapshot onto the meeting
-        let profile = profileStore.activeProfile
-        meeting.profile = profile
-        meeting.brief = nextCallBrief.nilIfEmpty
-        meeting.profileSnapshotData = profile.flatMap { try? JSONEncoder().encode($0.kinds) }
+        let meeting = makeMeeting(in: modelContext)
+        // Persist the shell before starting capture so no throwable operation
+        // remains after the audio/transcription session becomes live.
+        do {
+            try modelContext.save()
+        } catch {
+            modelContext.delete(meeting)
+            try? modelContext.save()
+            throw error
+        }
 
         // Set up audio capture. On failure, remove the just-inserted meeting —
         // otherwise it lingers as a ghost .recording row until the next launch's
@@ -200,6 +225,8 @@ final class RecordingManager {
             try? modelContext.save()
             throw error
         }
+        let epoch = Date.now
+        meeting.date = epoch
         meeting.systemAudioPath = audioCaptureManager.systemAudioURL?.path ?? ""
         meeting.micAudioPath = audioCaptureManager.micAudioURL?.path
 
@@ -219,18 +246,15 @@ final class RecordingManager {
         // deliberately NOT started: mid-call LLM cards are off in this build —
         // the AI budget goes to the post-call cleanup + report instead, and the
         // call itself runs with zero analysis overhead.
-        transcriptionEngine.onSegment = { [weak self] result in
-            Task { @MainActor in
-                self?.addSegment(result)
-            }
-        }
-
-        transcriptionEngine.startTranscribing(meetingStartTime: .now)
-        callAnalysisEngine.provider.resetUsage()  // this call's token meter starts at zero
+        transcriptionEngine.onSegment = { [weak self] result in self?.addSegment(result) }
 
         currentMeeting = meeting
-        recordingStartTime = .now
+        recordingStartTime = epoch
+        captureEpoch = epoch
+        captureSessionID = UUID()
+        spans = [MeetingSpan(meeting: meeting, startElapsed: 0, endElapsed: nil)]
         isRecording = true
+        transcriptionEngine.startTranscribing(meetingStartTime: epoch)
 
         // Start elapsed time timer
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -240,11 +264,12 @@ final class RecordingManager {
             }
         }
 
-        try modelContext.save()
+        do { try modelContext.save() }
+        catch { NSLog("Parrot: recording state save deferred — \(error.localizedDescription)") }
     }
 
     func stopRecording() async {
-        guard isRecording, !isStopping else { return }
+        guard isRecording, !isStopping, !isHandingOff else { return }
         isStopping = true
         defer { isStopping = false }
 
@@ -259,42 +284,362 @@ final class RecordingManager {
         // Drain the transcription backlog so the call's final words land before
         // the transcript is assembled for the summary/coaching reports.
         await transcriptionEngine.stopTranscribing()
-        // onSegment persists segments via Task { @MainActor } hops; yield once so
-        // the last enqueued addSegment jobs run before we read segments back.
+        // Segment delivery is a synchronous MainActor callback; this final yield
+        // lets any unrelated UI work observe the fully drained transcript.
         await Task.yield()
 
         // Update meeting
-        if let meeting = currentMeeting {
-            meeting.duration = elapsedTime
+        if let span = spans.last {
+            let meeting = span.meeting
+            let endElapsed = captureEpoch.map { Date.now.timeIntervalSince($0) }
+                ?? (span.startElapsed + elapsedTime)
+            spans[spans.count - 1].endElapsed = endElapsed
+            meeting.duration = max(0, endElapsed - span.startElapsed)
             meeting.status = .processing
             try? modelContext?.save()
-
-            // Post-processing chain, strictly sequential: the calendar lookup
-            // names who the call was with, Claude cleans the transcript text
-            // in place (optional, best-effort), and the report is generated
-            // from the FINAL text — never from a transcript that's about to
-            // change. postProcess stays for the import path; for live
-            // two-track recordings it's a no-op that preserves Me/Them.
             let meetingRef = meeting
-            Task {
-                let counterpart = await CalendarLookup.counterpartName(
-                    around: meetingRef.date, duration: meetingRef.duration)
-                let cleaning = await self.cleanTranscript(
-                    meeting: meetingRef, counterpart: counterpart)
-                await self.postProcess(meeting: meetingRef)
-                if self.callAnalysisEngine.isEnabled, self.callAnalysisEngine.provider.isConfigured {
-                    await self.generateSummary(meeting: meetingRef, counterpartName: counterpart)
-                }
-                // Last in the chain so the meter has seen the summary/coaching calls too.
-                self.writeAIUsage(meeting: meetingRef, cleaning: cleaning)
-                meetingRef.status = .done
-                try? self.modelContext?.save()
+            enqueuePostChain {
+                await self.finalizeMeetingInsideGate(meetingRef)
             }
         }
 
         isRecording = false
         elapsedTime = 0
         recordingStartTime = nil
+    }
+
+    /// Rotate the persisted meeting without interrupting capture or the
+    /// transcription loop. `boundaryElapsed` uses the original capture clock,
+    /// so it may safely be backdated into a decoded silence gap.
+    @discardableResult
+    func handoffRecording(
+        modelContext: ModelContext,
+        title: String?,
+        boundaryElapsed requestedBoundary: TimeInterval,
+        provisional: Bool = false
+    ) async throws -> Meeting? {
+        guard isRecording, !isStopping, !isHandingOff,
+              let epoch = captureEpoch, let oldSpan = spans.last else { return nil }
+        isHandingOff = true
+        defer { isHandingOff = false }
+
+        let nowElapsed = max(0, Date.now.timeIntervalSince(epoch))
+        let boundary = min(nowElapsed, max(oldSpan.startElapsed, requestedBoundary))
+        let meeting = makeMeeting(
+            in: modelContext,
+            title: title,
+            date: epoch.addingTimeInterval(boundary)
+        )
+        // Establish B durably before the irreversible writer rotation. If this
+        // save fails, A keeps recording untouched and the scheduler may retry.
+        do {
+            try modelContext.save()
+        } catch {
+            modelContext.delete(meeting)
+            try? modelContext.save()
+            throw error
+        }
+        let urls = audioCaptureManager.rotateFiles()
+        guard let systemURL = urls.system else {
+            modelContext.delete(meeting)
+            try? modelContext.save()
+            return nil
+        }
+
+        let oldMeeting = oldSpan.meeting
+        spans[spans.count - 1].endElapsed = boundary
+        oldMeeting.duration = max(0, boundary - oldSpan.startElapsed)
+        oldMeeting.status = .processing
+
+        meeting.systemAudioPath = systemURL.path
+        meeting.micAudioPath = urls.mic?.path
+        spans.append(MeetingSpan(meeting: meeting, startElapsed: boundary, endElapsed: nil))
+        currentMeeting = meeting
+        recordingStartTime = epoch.addingTimeInterval(boundary)
+        elapsedTime = max(0, nowElapsed - boundary)
+        // The context already accepted B above. A later save failure is logged,
+        // but cannot safely roll back a writer rotation; subsequent segment
+        // saves retry persistence while capture continues without a gap.
+        do { try modelContext.save() }
+        catch { NSLog("Parrot: handoff state save deferred — \(error.localizedDescription)") }
+
+        let sessionID = captureSessionID
+        enqueuePostChain {
+            let complete = await self.waitForCompleteness(
+                through: provisional ? boundary + 30 : boundary,
+                sessionID: sessionID)
+            if provisional {
+                await self.refineBoundary(
+                    provisional: boundary, previous: oldMeeting,
+                    next: meeting, sessionID: sessionID)
+            }
+            await self.finalizeMeetingInsideGate(
+                oldMeeting, allowEmptyDiscard: complete)
+        }
+        return meeting
+    }
+
+    /// Records scheduler ownership without baking calendar state into Meeting.
+    /// The marker only lives for this app run and exists solely for safe empty
+    /// auto-recording cleanup.
+    func markAutoStarted(_ meeting: Meeting?) {
+        if let meeting { autoStartedMeetingIDs.insert(meeting.id) }
+    }
+
+    var captureElapsed: TimeInterval? {
+        captureEpoch.map { max(0, Date.now.timeIntervalSince($0)) }
+    }
+
+    var currentSpanStartElapsed: TimeInterval? { spans.last?.startElapsed }
+
+    var canManualHandoff: Bool {
+        isRecording && !isStopping && !isHandingOff && !autoRecorder.isManagingCurrentRecording
+    }
+
+    var decodedThrough: TimeInterval {
+        transcriptionEngine.consumedThrough(
+            activeSources: transcriptionEngine.sourcesWithAudio())
+    }
+
+    /// Decoded speech intervals on the uninterrupted capture clock. Auto-split
+    /// policy consumes this read-only view; segment ownership remains private.
+    func recordedSpeechIntervals() -> [ClosedRange<TimeInterval>] {
+        spans.flatMap { span in
+            span.meeting.segments.map {
+                (span.startElapsed + $0.startTime)...(span.startElapsed + $0.endTime)
+            }
+        }
+    }
+
+    @discardableResult
+    func handoffRecording(modelContext: ModelContext, title: String? = nil) async throws -> Meeting? {
+        guard let boundary = captureElapsed else { return nil }
+        return try await handoffRecording(
+            modelContext: modelContext, title: title,
+            boundaryElapsed: boundary, provisional: false)
+    }
+
+    private func makeMeeting(
+        in modelContext: ModelContext,
+        title: String? = nil,
+        date: Date = .now
+    ) -> Meeting {
+        let meeting = Meeting(title: title, date: date)
+        modelContext.insert(meeting)
+        let profile = profileStore.activeProfile
+        meeting.profile = profile
+        meeting.brief = nextCallBrief.nilIfEmpty
+        meeting.profileSnapshotData = profile.flatMap { try? JSONEncoder().encode($0.kinds) }
+        return meeting
+    }
+
+    /// FIFO serialization for every provider-calling post-call path. Reset and
+    /// usage snapshot happen inside each operation, so one meeting cannot read
+    /// another meeting's token totals.
+    @discardableResult
+    private func enqueuePostChain(
+        _ operation: @escaping @MainActor () async -> Void
+    ) -> Task<Void, Never> {
+        let previous = postChainTail
+        let task = Task { @MainActor in
+            await previous?.value
+            await operation()
+        }
+        postChainTail = task
+        return task
+    }
+
+    private func runPostChain(_ operation: @escaping @MainActor () async -> Void) async {
+        await enqueuePostChain(operation).value
+    }
+
+    private func finalizeMeetingInsideGate(
+        _ meeting: Meeting,
+        allowEmptyDiscard: Bool = true
+    ) async {
+        guard !meeting.isDeleted else { return }
+        if autoStartedMeetingIDs.contains(meeting.id), meeting.segments.isEmpty {
+            if allowEmptyDiscard {
+                autoStartedMeetingIDs.remove(meeting.id)
+                delete(meeting)
+                return
+            }
+            autoStartedMeetingIDs.remove(meeting.id)
+        } else {
+            autoStartedMeetingIDs.remove(meeting.id)
+        }
+
+        callAnalysisEngine.provider.resetUsage()
+        let counterpart = await CalendarLookup.counterpartName(
+            around: meeting.date, duration: meeting.duration)
+        guard !meeting.isDeleted else { return }
+        let cleaning = await cleanTranscript(meeting: meeting, counterpart: counterpart)
+        guard !meeting.isDeleted else { return }
+        await postProcess(meeting: meeting)
+        guard !meeting.isDeleted else { return }
+        if callAnalysisEngine.isEnabled, callAnalysisEngine.provider.isConfigured {
+            await generateSummary(meeting: meeting, counterpartName: counterpart)
+        }
+        guard !meeting.isDeleted else { return }
+        writeAIUsage(meeting: meeting, cleaning: cleaning)
+        meeting.status = .done
+        try? modelContext?.save()
+    }
+
+    private func waitForCompleteness(
+        through boundary: TimeInterval,
+        sessionID: UUID
+    ) async -> Bool {
+        let deadline = Date.now.addingTimeInterval(180)
+        // Provisional title cuts deliberately ask for 30 seconds of future
+        // record before refinement. Wait for that capture horizon first.
+        while captureSessionID == sessionID,
+              (captureElapsed ?? boundary) < boundary,
+              !transcriptionEngine.isStopped,
+              Date.now < deadline {
+            try? await Task.sleep(for: .seconds(2))
+        }
+        let horizonReached = captureSessionID != sessionID
+            || transcriptionEngine.isStopped
+            || (captureElapsed ?? boundary) >= boundary
+
+        let targets = transcriptionEngine.completionTargets(through: boundary)
+        while captureSessionID == sessionID,
+              !transcriptionEngine.hasCompleted(targets),
+              !transcriptionEngine.isStopped,
+              Date.now < deadline {
+            try? await Task.sleep(for: .seconds(2))
+        }
+        let localComplete = transcriptionEngine.hasCompleted(targets)
+        if transcriptionEngine.hasHealthyStreamingSource {
+            try? await Task.sleep(for: .seconds(5))
+        }
+        await Task.yield()
+        return horizonReached && (
+            captureSessionID != sessionID
+                || transcriptionEngine.isStopped
+                || localComplete
+        )
+    }
+
+    private func refineBoundary(
+        provisional: TimeInterval,
+        previous: Meeting,
+        next: Meeting,
+        sessionID: UUID
+    ) async {
+        guard captureSessionID == sessionID,
+              !previous.isDeleted, !next.isDeleted,
+              let previousIndex = spans.firstIndex(where: { $0.meeting.id == previous.id }),
+              previousIndex + 1 < spans.count,
+              spans[previousIndex + 1].meeting.id == next.id else { return }
+
+        let oldBoundary = spans[previousIndex + 1].startElapsed
+        let speech = recordedSpeechIntervals()
+        let horizon = transcriptionEngine.isStreaming
+            ? (captureElapsed ?? spans.last?.endElapsed ?? provisional)
+            : max(decodedThrough, provisional)
+        let refined = Self.refinedBoundary(
+            provisional: provisional, speech: speech, horizon: horizon,
+            minimumBoundary: spans[previousIndex].startElapsed,
+            maximumBoundary: spans[previousIndex + 1].endElapsed)
+        guard abs(refined - oldBoundary) > 0.001 else { return }
+
+        let previousStart = spans[previousIndex].startElapsed
+        Self.applyRefinedBoundary(
+            previous: previous, next: next,
+            previousStart: previousStart, oldBoundary: oldBoundary,
+            refined: refined, nextEnd: spans[previousIndex + 1].endElapsed,
+            captureEpoch: captureEpoch)
+
+        spans[previousIndex].endElapsed = refined
+        spans[previousIndex + 1].startElapsed = refined
+        if currentMeeting?.id == next.id, let epoch = captureEpoch {
+            recordingStartTime = epoch.addingTimeInterval(refined)
+            elapsedTime = max(0, Date.now.timeIntervalSince(recordingStartTime!))
+        }
+        try? modelContext?.save()
+    }
+
+    /// Stateful core of boundary refinement, separated so the CLI harness can
+    /// exercise the real SwiftData relationship and timestamp mutations.
+    static func applyRefinedBoundary(
+        previous: Meeting,
+        next: Meeting,
+        previousStart: TimeInterval,
+        oldBoundary: TimeInterval,
+        refined: TimeInterval,
+        nextEnd: TimeInterval?,
+        captureEpoch: Date?
+    ) {
+        let allSegments = previous.segments.map {
+            (segment: $0, globalStart: previousStart + $0.startTime,
+             globalEnd: previousStart + $0.endTime)
+        } + next.segments.map {
+            (segment: $0, globalStart: oldBoundary + $0.startTime,
+             globalEnd: oldBoundary + $0.endTime)
+        }
+        for item in allSegments {
+            let destination = item.globalStart < refined ? previous : next
+            let destinationStart = destination.id == previous.id ? previousStart : refined
+            item.segment.meeting = destination
+            item.segment.startTime = max(0, item.globalStart - destinationStart)
+            item.segment.endTime = max(item.segment.startTime, item.globalEnd - destinationStart)
+        }
+        previous.duration = max(0, refined - previousStart)
+        if let nextEnd { next.duration = max(0, nextEnd - refined) }
+        if let captureEpoch { next.date = captureEpoch.addingTimeInterval(refined) }
+    }
+
+    /// Refines a provisional title-triggered cut into a nearby real silence.
+    /// Ten seconds is deliberate: fast call switches may not produce the 30 s
+    /// gap required for an autonomous split, but a title change already proves
+    /// the user moved and only asks this helper to improve the cut location.
+    nonisolated static func refinedBoundary(
+        provisional: TimeInterval,
+        speech: [ClosedRange<TimeInterval>],
+        horizon: TimeInterval? = nil,
+        minimumBoundary: TimeInterval? = nil,
+        maximumBoundary: TimeInterval? = nil
+    ) -> TimeInterval {
+        let merged = mergedSpeech(speech)
+        var gaps = zip(merged, merged.dropFirst()).compactMap { left, right -> ClosedRange<TimeInterval>? in
+            guard right.lowerBound - left.upperBound >= 10 else { return nil }
+            return left.upperBound...right.lowerBound
+        }
+        if let last = merged.last, let horizon,
+           horizon - last.upperBound >= 10 {
+            gaps.append(last.upperBound...horizon)
+        }
+        let candidates = gaps.filter {
+            $0.upperBound >= provisional - 60
+                && $0.lowerBound <= provisional + 30
+                && $0.lowerBound >= (minimumBoundary ?? -.infinity)
+                && $0.lowerBound <= (maximumBoundary ?? .infinity)
+        }
+        guard let gap = candidates.min(by: {
+            abs($0.lowerBound - provisional) < abs($1.lowerBound - provisional)
+        }) else { return provisional }
+        let boundedStart = max(gap.lowerBound + 2, minimumBoundary ?? -.infinity)
+        return min(boundedStart, min(maximumBoundary ?? gap.upperBound, gap.upperBound))
+    }
+
+    nonisolated private static func mergedSpeech(
+        _ speech: [ClosedRange<TimeInterval>]
+    ) -> [ClosedRange<TimeInterval>] {
+        let sorted = speech.sorted { $0.lowerBound < $1.lowerBound }
+        guard var current = sorted.first else { return [] }
+        var merged: [ClosedRange<TimeInterval>] = []
+        for interval in sorted.dropFirst() {
+            if interval.lowerBound <= current.upperBound {
+                current = current.lowerBound...max(current.upperBound, interval.upperBound)
+            } else {
+                merged.append(current)
+                current = interval
+            }
+        }
+        merged.append(current)
+        return merged
     }
 
     // MARK: - File Import
@@ -384,14 +729,19 @@ final class RecordingManager {
         //    labels and flips status to .done; the summary runs when the copilot
         //    is configured. Coaching is skipped — no "Me" channel to measure.
         importProgress?.phase = .analyzing
-        await postProcess(meeting: meeting)
-        if callAnalysisEngine.isEnabled, callAnalysisEngine.provider.isConfigured {
-            callAnalysisEngine.provider.resetUsage()
-            await generateSummary(meeting: meeting, includeCoaching: false)
+        await runPostChain {
+            guard !meeting.isDeleted else { return }
+            self.callAnalysisEngine.provider.resetUsage()
+            await self.postProcess(meeting: meeting)
+            guard !meeting.isDeleted else { return }
+            if self.callAnalysisEngine.isEnabled, self.callAnalysisEngine.provider.isConfigured {
+                await self.generateSummary(meeting: meeting, includeCoaching: false)
+            }
+            guard !meeting.isDeleted else { return }
+            self.writeAIUsage(meeting: meeting, backendOverride: .local)
+            meeting.status = .done
+            try? self.modelContext?.save()
         }
-        writeAIUsage(meeting: meeting, backendOverride: .local)
-        meeting.status = .done
-        try? modelContext?.save()
     }
 
     // MARK: - Deletion
@@ -404,6 +754,7 @@ final class RecordingManager {
             try? FileManager.default.removeItem(atPath: path)
         }
         if currentMeeting?.id == meeting.id { currentMeeting = nil }
+        autoStartedMeetingIDs.remove(meeting.id)
         modelContext?.delete(meeting)
         try? modelContext?.save()
     }
@@ -411,14 +762,14 @@ final class RecordingManager {
     // MARK: - Segment Storage
 
     private func addSegment(_ result: TranscriptionEngine.TranscriptionResult) {
-        // Use the live meeting object directly. The previous code looked the
-        // meeting up via model(for: meetingID) where meetingID was captured before
-        // the context was saved — i.e. a TEMPORARY identifier that goes stale after
-        // save. Resolving that stale id returned a malformed object and assigning it
-        // to segment.meeting tripped a SwiftData assertion (crash). currentMeeting
-        // is the same registered instance in the same context, set before any
-        // segment can arrive.
-        guard let modelContext, let meeting = currentMeeting else { return }
+        guard let modelContext, !spans.isEmpty else { return }
+        let boundaries = spans.dropFirst().map(\.startElapsed)
+        let index = Self.spanIndex(for: result.startTime, boundaries: boundaries)
+        let span = spans[min(index, spans.count - 1)]
+        let meeting = span.meeting
+        guard !meeting.isDeleted else { return }
+        let localStart = max(0, result.startTime - span.startElapsed)
+        let localEnd = max(localStart, result.endTime - span.startElapsed)
 
         // Speaker bleed: without headphones the mic hears the speakers, the
         // AEC attenuates but can't always erase it, and the residual decodes —
@@ -429,7 +780,7 @@ final class RecordingManager {
         // whichever order they decoded in. (Surfaced by the speakers-playback
         // live test 2026-08-01; previously masked by the glossary decode bug.)
         let bleedWindow: TimeInterval = 2.5
-        let neighbors = meeting.segments.filter { abs($0.startTime - result.startTime) <= bleedWindow }
+        let neighbors = meeting.segments.filter { abs($0.startTime - localStart) <= bleedWindow }
         if result.source == .me,
            neighbors.contains(where: { $0.speakerLabel == AudioSource.them.label
                && Self.isEchoDuplicate($0.text, result.text) }) {
@@ -443,8 +794,8 @@ final class RecordingManager {
         }
 
         let segment = TranscriptSegment(
-            startTime: result.startTime,
-            endTime: result.endTime,
+            startTime: localStart,
+            endTime: localEnd,
             text: result.text,
             speakerLabel: result.source.label,
             confidence: result.confidence
@@ -453,6 +804,17 @@ final class RecordingManager {
         modelContext.insert(segment)
         segment.meeting = meeting
         try? modelContext.save()
+    }
+
+    /// Returns the span containing a capture-relative timestamp. A boundary
+    /// belongs to the new span, matching `[start, end)` interval semantics.
+    nonisolated static func spanIndex(
+        for time: TimeInterval,
+        boundaries: [TimeInterval]
+    ) -> Int {
+        boundaries.reduce(into: 0) { index, boundary in
+            if time >= boundary { index += 1 }
+        }
     }
 
     /// Near-verbatim match for the echo-dedup above: Whisper decodes the bleed

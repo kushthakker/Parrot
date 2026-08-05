@@ -88,7 +88,7 @@ the decision a pure function:
 
 ```swift
 // record: merged speech intervals from the meeting's segments (capture-relative),
-// trustworthy up to `horizon` = engine.consumedThrough().
+// trustworthy up to `horizon` = manager.decodedThrough.
 struct SplitInputs {
     var now, horizon: TimeInterval          // capture-relative
     var recordingStart, currentEnd, nextStart: TimeInterval
@@ -96,9 +96,11 @@ struct SplitInputs {
     var lastSpeechAt: TimeInterval          // live estimate (levels + segments)
     var titleSignal: TitleSignal
 }
-// Find the first silence gap in the record: length ≥ 30s, starting after
-// max(recordingStart, nextStart − 600). Trailing silence (last speech → horizon)
-// counts. Returns the gap, or nil.
+// Find the first credible silence gap in the record: length ≥ 30s, starting
+// after max(recordingStart, nextStart − 600), whose upper edge reaches within
+// 60s of the scheduled boundary. Trailing or wholly silent decoded time counts.
+// The boundary proximity guard prevents an old conversational pause inside A
+// from being mistaken for the A→B switch merely because later A speech exists.
 static func splitGap(_ i: SplitInputs) -> ClosedRange<TimeInterval>?
 
 static func splitDecision(_ i: SplitInputs) -> (fire: Bool, boundary: TimeInterval?) {
@@ -197,11 +199,16 @@ file. No token, no extra lock on the hot path, no reachable truncation state.
 
 Mic-less recordings: mic side is a no-op, returns `nil` (B is single-track like A).
 
-### 4.2 `TranscriptionEngine` — two tiny additions, loop untouched
+### 4.2 `TranscriptionEngine` — completed-decode horizon
 
-- `func consumedThrough() -> TimeInterval` — under `bufferLock`, `min` over
-  **active** sources of `consumedSamples[source] / 16_000 +
-  (localClockOffset[source] ?? 0)`. The offset term is load-bearing (review
+- `func consumedThrough(activeSources:) -> TimeInterval` — under `bufferLock`,
+  `min` over a separate **completed-decode watermark** for active local sources.
+  `consumedSamples` itself is not sufficient: the loop advances it when it
+  dequeues a chunk, before the async Whisper decode and segment persistence have
+  finished. Silence advances the completed watermark immediately; speech only
+  advances it after decode/filtering and synchronous MainActor segment delivery.
+  Each watermark is capture-relative and includes `localClockOffset[source]`.
+  The offset term is load-bearing (review
   finding): it is exactly how segment timestamps are computed
   (`TranscriptionEngine.swift:410`), and after a mid-call mic device change
   `reanchorLocalClock` shifts the mic clock forward to skip the dead gap —
@@ -212,7 +219,7 @@ Mic-less recordings: mic side is a no-op, returns `nil` (B is single-track like 
 - `var isStopped: Bool` — `transcriptionTask == nil`. A finished drain implies
   everything was consumed; used as the wait's escape hatch (§4.4).
 
-No changes to `startTranscribing` / `stopTranscribing` / the decode loop.
+No changes to the decode algorithm or start/stop behavior.
 `meetingStartTime` and the sample clocks stay anchored to **capture start** for
 the whole multi-meeting session; per-meeting re-anchoring happens at persist
 time (§4.3), not in the engine.
@@ -254,7 +261,7 @@ call moment, backdated into the recorded silence between the calls.
 
 **Boundary refinement (simulation finding):** the title path can fire before
 the record has caught up to the switch (heavy decode lag) — its `now` boundary
-is provisional. After the handoff, when `consumedThrough() ≥ provisional + 30`,
+is provisional. After the handoff, when `decodedThrough ≥ provisional + 30`,
 search the record for the true silence gap overlapping
 `[provisional − 60, provisional + 30]`; if found, move the span boundary to
 `gap.start + 2` and reassign the few segments that landed in between (update
@@ -276,7 +283,10 @@ cleanup, summary, and the user read) is always cut correctly.
 3. Close A: `spans[last].endElapsed = boundaryElapsed`; `meeting.duration = boundaryElapsed − span.startElapsed`; `status = .processing`; save.
 4. Create B via `makeMeeting()` (extract the meeting-creation block from `startRecording:183–191` — profile, brief, snapshot — so both paths share it).
 5. `let urls = audioCaptureManager.rotateFiles()`; assign B's `systemAudioPath` / `micAudioPath`; set B's title from the event invite.
-6. Append B's span; `currentMeeting = B`; `recordingStartTime = .now`; `elapsedTime = 0`; save. (LiveRecordingView follows `currentMeeting` observably — the timer and transcript reset to B on their own.)
+6. Append B's span; `currentMeeting = B`; set `recordingStartTime` to the
+   absolute span boundary and `elapsedTime` to time since that boundary; save.
+   (LiveRecordingView follows `currentMeeting` observably — the transcript
+   resets to B on its own.)
 7. Spawn A's **finalize task** (§4.4). Total await-free work ≈ milliseconds; no drain, no capture restart.
 
 **`stopRecording`** refactor: extract the post-chain block
@@ -292,13 +302,13 @@ handoff time A's final words are still in the decode backlog. Before A's chain
 runs:
 
 ```swift
-while engine.consumedThrough() < boundaryElapsed && !engine.isStopped && elapsed < 180 {
+while manager.decodedThrough < boundaryElapsed && !engine.isStopped && elapsed < 180 {
     try? await Task.sleep(for: .seconds(2))
 }
-await Task.yield()   // let the last enqueued addSegment hops land
+await Task.yield()   // let observers see the synchronously persisted final segment
 ```
 
-- `consumedThrough ≥ boundary` ⇒ every A-chunk decoded ⇒ every A-segment emitted.
+- `decodedThrough ≥ boundary` ⇒ every A-chunk decoded ⇒ every A-segment persisted.
 - `isStopped` ⇒ user stopped B and the drain finished ⇒ trivially complete.
 - 180 s cap ⇒ a wedged decode can't block A's report forever (matches the
   existing "drain is uncapped" ponytail note in `TranscriptionEngine.swift:689`).
@@ -409,11 +419,11 @@ the user skipping B while A runs long (never force-split while `showsCurrent`).
 
 ### 8.0 Executable simulation (already run — this is how §3.3 got its shape)
 
-`docs/b2b-simulation.py` models the full tick state machine against 12
+`docs/b2b-simulation.py` models the full tick state machine against 13
 scenarios × 4 tick phases × 2 decode lags (10 s / 45 s thermal throttle), for
 Stage 1 and Stage 2, checking five invariants (per-meeting coverage, zero
 speech loss, no overlap/double-start, no poisoning, cut-lands-in-silence).
-Result: **Stage 2 planned design passes all 96 runs**; Stage 1 passes except
+Result: **Stage 2 planned design passes all 104 runs**; Stage 1 passes except
 the two documented cut-at-detection cases at 45 s lag. Two sabotage variants
 prove the rules are load-bearing: stopped-tick marking fails "manual stop 5 s
 before the boundary" (B poisoned forever), and removing the `showsCurrent`

@@ -14,10 +14,21 @@ struct MenuBarView: View {
         if recordingManager.isRecording {
             Text("Recording — \(recordingManager.formattedElapsedTime)")
 
+            Button("Stop & Start Next") {
+                Task {
+                    do {
+                        _ = try await recordingManager.handoffRecording(modelContext: modelContext)
+                    } catch {
+                        NSLog("Parrot: manual handoff failed — \(error.localizedDescription)")
+                    }
+                }
+            }
+            .disabled(!recordingManager.canManualHandoff)
+
             Button(recordingManager.isStopping ? "Finalizing…" : "Stop Recording") {
                 Task { await recordingManager.stopRecording() }
             }
-            .disabled(recordingManager.isStopping)
+            .disabled(recordingManager.isStopping || recordingManager.isHandingOff)
         } else {
             Text(recordingManager.transcriptionEngine.isReady
                  ? "Ready — \(profileStore.activeProfile?.name ?? "Default")"

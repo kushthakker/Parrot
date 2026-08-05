@@ -37,6 +37,12 @@ enum ProfileTest {
         testCopilotBudget()
         testTranscriptCleaner()
         testAutoRecorderHelpers()
+        testAutoRecorderSplitPolicy()
+        testAutoRecorderTitleSignal()
+        testAutoRecorderTransition()
+        testMeetingSpanHelpers()
+        testMeetingBoundaryMutation()
+        testMixedTranscriptionGate()
         testCalendarBestMatch()
         print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
         exit(failures == 0 ? 0 : 1)
@@ -94,6 +100,175 @@ enum ProfileTest {
                   != MeetingAutoRecorder.occurrenceKey(identifier: "evt", start: day2))
     }
 
+    static func testAutoRecorderSplitPolicy() {
+        func input(
+            now: Double = 160, horizon: Double = 145,
+            recordingStart: Double = 0, currentEnd: Double = 100,
+            nextStart: Double = 100,
+            speech: [ClosedRange<Double>] = [0...85, 120...140],
+            lastSpeechAt: Double = 140,
+            signal: MeetingAutoRecorder.TitleSignal = .unknown
+        ) -> MeetingAutoRecorder.SplitInputs {
+            .init(now: now, horizon: horizon, recordingStart: recordingStart,
+                  currentEnd: currentEnd, nextStart: nextStart, speech: speech,
+                  lastSpeechAt: lastSpeechAt, titleSignal: signal)
+        }
+
+        let confirmed = MeetingAutoRecorder.splitDecision(input())
+        check("b2b confirmed gap fires", confirmed.fire && confirmed.boundary == 87)
+        check("b2b confirmed gap is exact", !confirmed.provisional)
+
+        let quiet = MeetingAutoRecorder.splitDecision(input(
+            now: 140, horizon: 140, speech: [0...90], lastSpeechAt: 92))
+        check("b2b persistent quiet fires", quiet.fire && quiet.boundary == 92)
+
+        let choppy = MeetingAutoRecorder.splitDecision(input(
+            now: 150, horizon: 150,
+            speech: [0...30, 55...80, 105...130], lastSpeechAt: 130))
+        check("b2b 25 second pauses do not split", !choppy.fire)
+
+        let forced = MeetingAutoRecorder.splitDecision(input(
+            now: 400, horizon: 400, speech: [0...400], lastSpeechAt: 400))
+        check("b2b force cap fires", forced.fire && forced.boundary == 400 && forced.provisional)
+        let held = MeetingAutoRecorder.splitDecision(input(
+            now: 400, horizon: 400, speech: [0...400], lastSpeechAt: 400,
+            signal: .showsCurrent))
+        check("b2b current title blocks force cap", !held.fire)
+
+        let titleMove = MeetingAutoRecorder.splitDecision(input(
+            now: 120, horizon: 90, speech: [0...80], lastSpeechAt: 80,
+            signal: .showsNext))
+        check("b2b next title fires with lagging record",
+              titleMove.fire && titleMove.boundary == 120 && titleMove.provisional)
+
+        let beforeEnd = MeetingAutoRecorder.splitDecision(input(
+            now: 95, horizon: 145, currentEnd: 100, speech: [0...85, 120...140]))
+        check("b2b audio path waits for current end", !beforeEnd.fire)
+
+        let oldPause = MeetingAutoRecorder.splitDecision(input(
+            now: 500, horizon: 500, currentEnd: 500, nextStart: 500,
+            speech: [0...100, 140...500], lastSpeechAt: 500))
+        check("b2b old conversational gap is ignored", !oldPause.fire)
+
+        let silent = MeetingAutoRecorder.splitGap(input(
+            now: 160, horizon: 145, speech: [], lastSpeechAt: 0))
+        check("b2b wholly silent decoded record has a gap", silent == 0...145)
+
+        let silentA = MeetingAutoRecorder.splitDecision(input(
+            now: 160, horizon: 145, speech: [120...145], lastSpeechAt: 145))
+        check("b2b silent A then speaking B uses leading gap",
+              silentA.fire && silentA.boundary == 2 && !silentA.provisional)
+    }
+
+    static func testAutoRecorderTitleSignal() {
+        check("b2b title matches next",
+              MeetingAutoRecorder.titleSignal(
+                windowTitles: ["Meet – Product Review — Chrome"],
+                currentTitle: "Planning", nextTitle: "Product Review") == .showsNext)
+        check("b2b title match is case insensitive",
+              MeetingAutoRecorder.titleSignal(
+                windowTitles: ["GOOGLE MEET — WEEKLY SYNC"],
+                currentTitle: "Weekly Sync", nextTitle: "Demo") == .showsCurrent)
+        check("b2b next title wins when both are visible",
+              MeetingAutoRecorder.titleSignal(
+                windowTitles: ["Meet — Current Call", "Meet — Next Call"],
+                currentTitle: "Current Call", nextTitle: "Next Call") == .showsNext)
+        check("b2b short event title is refused",
+              MeetingAutoRecorder.titleSignal(
+                windowTitles: ["Meet — One"], currentTitle: nil, nextTitle: "One") == .unknown)
+        check("b2b non-Meet window is ignored",
+              MeetingAutoRecorder.titleSignal(
+                windowTitles: ["Product Review — Notes"],
+                currentTitle: nil, nextTitle: "Product Review") == .unknown)
+    }
+
+    static func testAutoRecorderTransition() {
+        let stopped = MeetingAutoRecorder.transitionMark(
+            wasRecording: true, isRecording: false, suppress: false,
+            ongoingAtLastRecordingTick: ["A"])
+        check("b2b stopped transition marks prior event", stopped.handled == ["A"])
+        let handoff = MeetingAutoRecorder.transitionMark(
+            wasRecording: true, isRecording: true, suppress: false,
+            ongoingAtLastRecordingTick: ["A"])
+        check("b2b handoff has no stopped transition", handoff.handled.isEmpty)
+        let suppressed = MeetingAutoRecorder.transitionMark(
+            wasRecording: true, isRecording: false, suppress: true,
+            ongoingAtLastRecordingTick: ["A"])
+        check("b2b split-stop suppression marks nothing",
+              suppressed.handled.isEmpty && !suppressed.suppressAfter)
+    }
+
+    static func testMeetingSpanHelpers() {
+        let boundaries: [Double] = [30, 70]
+        check("span routes before first boundary", RecordingManager.spanIndex(for: 29.999, boundaries: boundaries) == 0)
+        check("span routes exact boundary forward", RecordingManager.spanIndex(for: 30, boundaries: boundaries) == 1)
+        check("span routes middle tail", RecordingManager.spanIndex(for: 69.999, boundaries: boundaries) == 1)
+        check("span routes third meeting", RecordingManager.spanIndex(for: 80, boundaries: boundaries) == 2)
+        check("span local time rebases", 80 - boundaries[1] == 10)
+
+        check("b2b provisional boundary refines into gap",
+              RecordingManager.refinedBoundary(
+                provisional: 120, speech: [0...90, 125...145], horizon: 145) == 92)
+        check("b2b continuous speech keeps provisional boundary",
+              RecordingManager.refinedBoundary(
+                provisional: 120, speech: [0...145], horizon: 145) == 120)
+        check("b2b triple handoff cannot reuse prior gap",
+              RecordingManager.refinedBoundary(
+                provisional: 160, speech: [0...90, 125...200], horizon: 200,
+                minimumBoundary: 120) == 160)
+    }
+
+    @MainActor
+    static func testMeetingBoundaryMutation() {
+        let schema = Schema([Meeting.self, TranscriptSegment.self, CallInsight.self, CallProfile.self])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        guard let container = try? ModelContainer(for: schema, configurations: [config]) else {
+            check("b2b refinement test container builds", false); return
+        }
+        let context = ModelContext(container)
+        let a = Meeting(title: "A"), b = Meeting(title: "B")
+        context.insert(a); context.insert(b)
+        let movesToB = TranscriptSegment(
+            startTime: 100, endTime: 105, text: "late A tail", speakerLabel: "Them")
+        let staysInB = TranscriptSegment(
+            startTime: 10, endTime: 15, text: "B", speakerLabel: "Them")
+        context.insert(movesToB); context.insert(staysInB)
+        movesToB.meeting = a
+        staysInB.meeting = b
+        let epoch = Date(timeIntervalSince1970: 1_700_000_000)
+        RecordingManager.applyRefinedBoundary(
+            previous: a, next: b, previousStart: 0, oldBoundary: 120,
+            refined: 92, nextEnd: 180, captureEpoch: epoch)
+        check("b2b refinement moves segment forward", movesToB.meeting?.id == b.id)
+        check("b2b refinement rebases moved segment", movesToB.startTime == 8 && movesToB.endTime == 13)
+        check("b2b refinement preserves B global time", staysInB.startTime == 38 && staysInB.endTime == 43)
+        check("b2b refinement updates durations", a.duration == 92 && b.duration == 88)
+        check("b2b refinement updates B date", b.date == epoch.addingTimeInterval(92))
+
+        let c = Meeting(title: "C"), d = Meeting(title: "D")
+        context.insert(c); context.insert(d)
+        let movesBack = TranscriptSegment(
+            startTime: 5, endTime: 9, text: "belongs to C", speakerLabel: "Them")
+        context.insert(movesBack); movesBack.meeting = d
+        RecordingManager.applyRefinedBoundary(
+            previous: c, next: d, previousStart: 0, oldBoundary: 120,
+            refined: 130, nextEnd: nil, captureEpoch: nil)
+        check("b2b refinement moves segment backward", movesBack.meeting?.id == c.id)
+        check("b2b backward move restores capture time", movesBack.startTime == 125)
+    }
+
+    static func testMixedTranscriptionGate() {
+        check("b2b mixed backend keeps streaming grace",
+              TranscriptionEngine.needsStreamingGrace(
+                sawAudioSources: [.me, .them], failedSources: [.me], hasStreamers: true))
+        check("b2b all-local backend needs no streaming grace",
+              !TranscriptionEngine.needsStreamingGrace(
+                sawAudioSources: [.me, .them], failedSources: [.me, .them], hasStreamers: true))
+        check("b2b absent streamers need no grace",
+              !TranscriptionEngine.needsStreamingGrace(
+                sawAudioSources: [.them], failedSources: [], hasStreamers: false))
+    }
+
     static func testCalendarBestMatch() {
         let base = Date(timeIntervalSince1970: 1_700_000_000)
         let recStart = base, recEnd = base.addingTimeInterval(1800)
@@ -106,6 +281,17 @@ enum ProfileTest {
               CalendarLookup.bestMatch(events: events, recordingStart: recStart, recordingEnd: recEnd) == 1)
         check("calendar returns nil with no overlap",
               CalendarLookup.bestMatch(events: [events[0]], recordingStart: recStart, recordingEnd: recEnd) == nil)
+        let adjacent = [
+            (start: base, end: base.addingTimeInterval(1800)),
+            (start: base.addingTimeInterval(1800), end: base.addingTimeInterval(3600)),
+        ]
+        check("calendar boundary window selects A",
+              CalendarLookup.bestMatch(events: adjacent, recordingStart: base,
+                                       recordingEnd: base.addingTimeInterval(1800)) == 0)
+        check("calendar boundary window selects B",
+              CalendarLookup.bestMatch(events: adjacent,
+                                       recordingStart: base.addingTimeInterval(1800),
+                                       recordingEnd: base.addingTimeInterval(3600)) == 1)
     }
 
     static func testKindStyleFallback() {

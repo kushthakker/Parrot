@@ -23,6 +23,17 @@ final class AudioCaptureManager: NSObject {
     /// recording, and the stale file object would hijack the NEXT recording's
     /// audio. Plain Bool across threads, same accepted pattern as `isCapturing`.
     private var filesClosed = true
+    /// Queue-confined write targets: each is owned by its stream's serial queue
+    /// and mutated only inside `queue.sync` blocks (startCapture seeds them
+    /// before any write can exist; rotateFiles flips them at a meeting handoff).
+    /// The lazy-create in the write block reads THESE — never an enqueue-time
+    /// URL — because an enqueue-time capture would race a rotation: a stale URL
+    /// paired with a fresh nil file object recreates AVAudioFile(forWriting:)
+    /// on the finished file, truncating it. Serial FIFO makes this airtight:
+    /// writes enqueued before a rotation land in the old file, writes after it
+    /// see (nil file, new URL) and create the next one.
+    private var systemQueueURL: URL?
+    private var micQueueURL: URL?
     private let systemWriteQueue = DispatchQueue(label: "com.uygar.parrot.audio.system")
     private let micWriteQueue = DispatchQueue(label: "com.uygar.parrot.audio.mic")
     /// Acoustic echo canceller, created per recording when enabled. Removes the
@@ -199,6 +210,11 @@ final class AudioCaptureManager: NSObject {
 
         systemAudioURL = storageDir.appendingPathComponent("system_\(timestamp).caf")
         micAudioURL = storageDir.appendingPathComponent("mic_\(timestamp).caf")
+        // Seed the queue-confined write targets on their own queues. Both
+        // queues are idle here (filesClosed has been true since the last stop),
+        // so the sync hop is instant.
+        systemWriteQueue.sync { systemQueueURL = systemAudioURL }
+        micWriteQueue.sync { micQueueURL = micAudioURL }
 
         inputDeviceName = Self.defaultDeviceName(input: true)
         outputDeviceName = Self.defaultDeviceName(input: false)
@@ -226,6 +242,7 @@ final class AudioCaptureManager: NSObject {
         } catch {
             micActive = false
             micAudioURL = nil
+            micWriteQueue.sync { micQueueURL = nil }
             NSLog("Parrot: microphone unavailable, recording system audio only — \(error.localizedDescription)")
         }
 
@@ -274,6 +291,47 @@ final class AudioCaptureManager: NSObject {
             let size = (attrs?[.size] as? Int) ?? 0
             NSLog("Parrot: system audio file finalized — \(size) bytes")
         }
+    }
+
+    // MARK: - File rotation (meeting handoff)
+
+    /// Start writing to fresh .caf files without stopping capture — the file
+    /// half of a hot meeting handoff. Per stream, the serial `sync` block is a
+    /// barrier: every already-enqueued write lands in the old file first, then
+    /// the old AVAudioFile deallocates (finalizing its .caf header) and the
+    /// queue-confined URL flips — all in one block, so no write can pair the
+    /// old URL with a new file object or vice versa. Capture, taps, and the
+    /// transcription feed never notice.
+    ///
+    /// Mic-less recordings return a nil mic URL (the next meeting is
+    /// single-track, like the current one).
+    @MainActor
+    func rotateFiles() -> (system: URL?, mic: URL?) {
+        guard isCapturing, !filesClosed else { return (nil, nil) }
+        let storageDir = Self.storageDirectory()
+        let timestamp = ISO8601DateFormatter().string(from: .now)
+            .replacingOccurrences(of: ":", with: "-")
+        let handoffID = UUID().uuidString
+
+        let newSystem = storageDir.appendingPathComponent("system_\(timestamp)_\(handoffID).caf")
+        systemWriteQueue.sync {
+            systemAudioFile = nil
+            systemQueueURL = newSystem
+        }
+        systemAudioURL = newSystem
+
+        var newMic: URL?
+        if micAudioURL != nil {
+            let url = storageDir.appendingPathComponent("mic_\(timestamp)_\(handoffID).caf")
+            micWriteQueue.sync {
+                micAudioFile = nil
+                micQueueURL = url
+            }
+            micAudioURL = url
+            newMic = url
+        }
+        NSLog("Parrot: rotated audio files for handoff")
+        return (newSystem, newMic)
     }
 
     // MARK: - System Audio (ScreenCaptureKit)
@@ -498,14 +556,18 @@ final class AudioCaptureManager: NSObject {
     /// The file is created lazily from the first buffer's own format, so writes can
     /// never fail on a format mismatch and there is no codec to initialize. The
     /// buffer is deep-copied because the audio system reuses it after we return.
+    ///
+    /// The write block resolves its target URL from the queue-confined
+    /// `systemQueueURL`/`micQueueURL` — never from a URL captured at enqueue
+    /// time — so a rotation between enqueue and execution can't truncate a
+    /// finished file (see the property comment).
     private func appendAudio(_ buffer: AVAudioPCMBuffer, to stream: AudioStream) {
         guard let copy = buffer.deepCopy() else { return }
         let queue = stream == .system ? systemWriteQueue : micWriteQueue
-        let url = stream == .system ? systemAudioURL : micAudioURL
-        guard let url else { return }
 
         queue.async { [weak self] in
             guard let self, !self.filesClosed else { return }
+            guard let url = (stream == .system ? self.systemQueueURL : self.micQueueURL) else { return }
             do {
                 let file: AVAudioFile
                 if stream == .system {

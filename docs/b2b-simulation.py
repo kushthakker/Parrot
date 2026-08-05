@@ -172,14 +172,20 @@ class Sim:
                     V = [(s, min(e, h)) for s, e in self.sc.speech if s <= h]
                     vis_end = max((e for _, e in V), default=None)
                     floor = max(self.recordings[-1].start, nxt.start - 600)
-                    g = None
-                    pts = sorted(V) + [(h, h)]
+                    gaps = []
+                    pts = sorted(V)
                     prev_end = None
                     for s, e in pts:
                         if prev_end is not None and s - prev_end >= 30 and prev_end >= floor:
-                            g = (prev_end, s)
-                            break
+                            gaps.append((prev_end, s))
                         prev_end = max(prev_end or 0, e)
+                    if prev_end is None:
+                        if h - floor >= 30:
+                            gaps.append((floor, h))
+                    elif h - prev_end >= 30 and prev_end >= floor:
+                        gaps.append((prev_end, h))
+                    credibility_edge = min(cur.end, nxt.start) - 60
+                    g = next((gap for gap in gaps if gap[1] >= credibility_edge), None)
                     speech_after_g = g is not None and any(s >= g[0] + 30 for s, _ in V)
                     quiet = now - self.last_speech
                     fire, boundary = False, None
@@ -376,10 +382,19 @@ SC.append(Scenario(
     speech=choppy + [(2255, 3550)],
     title=[(0, 2205, "A"), (2245, 3600, "B")],
     expect_split_count=1))
+# 10. A had an ordinary 40s conversational pause long before the boundary.
+#     Later A speech must not "confirm" that old pause as the meeting switch.
+SC.append(Scenario(
+    "10 old A pause before real switch",
+    events=[Event("A", 0, 1800), Event("B", 1800, 3600)],
+    speech=[(30, 1200), (1240, 1950), (1985, 3550)],
+    expect_split_count=1))
 
 
 def main():
     grand_fail = 0
+    planned_stage2_fail = 0
+    sabotage_failures = {}
     for variant, kw in [
         ("PLANNED (prev-tick mark, quiet⊣title)", dict(mark_prev_tick_set=True, quiet_blocked_by_title=True)),
         ("naive-mark (stopped-tick set)", dict(mark_prev_tick_set=False, quiet_blocked_by_title=True)),
@@ -406,6 +421,10 @@ def main():
                 status = "PASS" if not fails else "FAIL"
                 if fails:
                     grand_fail += 1
+                    if variant.startswith("PLANNED") and stage == 2:
+                        planned_stage2_fail += 1
+                    if not variant.startswith("PLANNED"):
+                        sabotage_failures[variant] = sabotage_failures.get(variant, 0) + 1
                 ss = ",".join(f"{s:.0f}" for s in splits) or "-"
                 print(f"[{status}] {sc.name:34s} splits@{ss:12s} lost={lost:5.1f}s"
                       f" (phase={phase:.0f} lag={lag:.0f})")
@@ -414,8 +433,16 @@ def main():
                 if fails:
                     for t, m in sim.log:
                         print(f"           {t:7.1f}  {m}")
-    print(f"\n{'ALL PASS (planned variant must be clean)' if grand_fail == 0 else f'{grand_fail} scenario-variant failures (expected for naive-mark)'}")
+    sabotage_ok = all(sabotage_failures.get(name, 0) > 0 for name in (
+        "naive-mark (stopped-tick set)",
+        "no title-block on quiet path",
+    ))
+    if planned_stage2_fail == 0 and sabotage_ok:
+        print(f"\nPASS: Stage 2 planned matrix clean; {grand_fail} expected control failures observed")
+        return 0
+    print(f"\nFAIL: {planned_stage2_fail} planned Stage 2 failures; sabotage controls valid={sabotage_ok}")
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

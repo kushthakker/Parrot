@@ -8,7 +8,7 @@ tree. Line counts are rough — they flag which files are worth reading whole.
 | File | L | Purpose |
 |---|---|---|
 | `Parrot/ParrotApp.swift` | 112 | `@main`; parses CLI harness flags before the SwiftUI `App` starts |
-| `Parrot/ProfileTest.swift` | 363 | `--profile-test`: headless logic harness, ~60 assertions |
+| `Parrot/ProfileTest.swift` | 790 | `--profile-test`: headless logic harness, including back-to-back split/span policy |
 | `Parrot/SnapshotTool.swift` | 522 | Offscreen PNG renderers + transcribe/analyze harnesses |
 
 ## Models (SwiftData `@Model` + Codable values)
@@ -27,10 +27,11 @@ tree. Line counts are rough — they flag which files are worth reading whole.
 
 | File | L | Purpose |
 |---|---|---|
-| `Services/RecordingManager.swift` | 623 | Orchestrates a recording session end-to-end; the hub |
-| `Services/AudioCaptureManager.swift` | 616 | ScreenCaptureKit system audio + mic tap, buffer conversion |
+| `Services/RecordingManager.swift` | 1009 | Recording hub: capture sessions, meeting spans/handoffs, persistence, post-call FIFO |
+| `Services/AudioCaptureManager.swift` | 859 | ScreenCaptureKit system audio + mic tap, buffer conversion, safe file rotation |
 | `Services/EchoCanceller.swift` | 138 | Swift wrapper over vendored SpeexDSP AEC |
-| `Services/TranscriptionEngine.swift` | 550 | On-device WhisperKit; `AudioSource` routing |
+| `Services/TranscriptionEngine.swift` | 845 | On-device WhisperKit; source routing + completed-decode horizons |
+| `Services/MeetingAutoRecorder.swift` | 396 | Calendar auto-start/stop and back-to-back Meet split policy/title signals |
 | `Services/CloudTranscription.swift` | 355 | Opt-in Groq (batch) and Deepgram (streaming) backends + WAV encode |
 | `Services/DiarizationEngine.swift` | 182 | Speaker attribution over transcript segments |
 | `Services/AnalysisProvider.swift` | 605 | `AnalysisProvider` protocol, request/result types, prompt building, **Keychain helpers** (~L575) |
@@ -61,7 +62,7 @@ tree. Line counts are rough — they flag which files are worth reading whole.
 | `Views/OllamaModelStatusView.swift` | 136 | Local model presence/pull status |
 | `Views/AudioImport.swift` | 108 | Drag-drop / file import of existing audio |
 | `Views/AppCommands.swift` | 240 | `AppSession`, menu commands, context menus, notifications |
-| `Views/MenuBarView.swift` | 59 | Menu bar extra |
+| `Views/MenuBarView.swift` | 69 | Menu bar extra, including manual hot handoff |
 | `Views/Theme.swift` | 151 | Single source of colors, fonts, metrics |
 
 ## Build & non-source

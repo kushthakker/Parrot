@@ -152,7 +152,22 @@ struct ParrotCommands: Commands {
                 }
             }
             .keyboardShortcut(".")
-            .disabled(!recordingManager.isRecording || recordingManager.isStopping)
+            .disabled(!recordingManager.isRecording || recordingManager.isStopping
+                      || recordingManager.isHandingOff)
+
+            Button("Stop & Start Next") {
+                Task { @MainActor in
+                    do {
+                        _ = try await recordingManager.handoffRecording(modelContext: modelContext)
+                    } catch {
+                        let alert = NSAlert()
+                        alert.messageText = "Couldn't start the next recording"
+                        alert.informativeText = error.localizedDescription
+                        alert.runModal()
+                    }
+                }
+            }
+            .disabled(!recordingManager.canManualHandoff)
         }
 
         // Help: the bundled Apple Help Book (searchable, offline), plus the

@@ -216,6 +216,8 @@ install: bundle
 .PHONY: test
 test: build
 	$(BINDIR)/Parrot --profile-test
+	@python3 docs/b2b-simulation.py > /dev/null
+	@echo "PASS back-to-back simulation matrix"
 
 .PHONY: xcode
 xcode:

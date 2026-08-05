@@ -48,6 +48,18 @@ final class TranscriptionEngine {
     /// over a long call; these running totals keep segment timestamps absolute.
     /// Guarded by `bufferLock` (the loop and `reanchorLocalClock` both touch it).
     private var consumedSamples: [AudioSource: Int] = [:]
+    /// Capture-relative watermark advanced only after a dequeued chunk has
+    /// finished decoding (and its segment callback has run), or after proven
+    /// silence has been discarded. Guarded by `bufferLock`.
+    private var completedThrough: [AudioSource: TimeInterval] = [:]
+    /// Capture-relative end of audio actually received per source. A source
+    /// that disappears before a handoff only needs decoding through its own
+    /// last buffer, not through a later wall-clock boundary. Guarded by lock.
+    private var receivedThrough: [AudioSource: TimeInterval] = [:]
+    /// Sources that have delivered at least one buffer this session. Lets
+    /// `consumedThrough(activeSources:)` skip a mic that never came up (its counter would sit
+    /// at 0 forever and stall every completeness wait). Guarded by `bufferLock`.
+    private var sawAudioSources: Set<AudioSource> = []
     private var meetingStartTime = Date()
 
     /// PARROT_LOOP_TRACE=1: print every raw decode piece before filtering —
@@ -69,8 +81,45 @@ final class TranscriptionEngine {
     /// live device bar.
     private(set) var cloudNotice: String?
 
+    /// True once the live transcription task has fully drained and released.
+    /// RecordingManager uses this as the completeness wait's escape hatch when
+    /// the user stops the final meeting during an earlier meeting's handoff.
+    @MainActor
+    var isStopped: Bool { transcriptionTask == nil }
+
+    /// Deepgram emits finalized segments directly and has no local decode
+    /// backlog while its sockets are healthy. Handoff finalization uses a short
+    /// grace instead of waiting on the local sample clock in that case.
+    @MainActor
+    var isStreaming: Bool {
+        !deepgramStreamers.isEmpty && bufferLock.withLock {
+            !sawAudioSources.isEmpty && deepgramFailedSources.isDisjoint(with: sawAudioSources)
+        }
+    }
+
+    /// True when at least one source that has delivered audio still routes to
+    /// Deepgram. A mixed session (one healthy stream + one local fallback)
+    /// needs both the local completion targets and the streaming-final grace.
+    @MainActor
+    var hasHealthyStreamingSource: Bool {
+        bufferLock.withLock {
+            Self.needsStreamingGrace(
+                sawAudioSources: sawAudioSources,
+                failedSources: deepgramFailedSources,
+                hasStreamers: !deepgramStreamers.isEmpty)
+        }
+    }
+
+    nonisolated static func needsStreamingGrace(
+        sawAudioSources: Set<AudioSource>,
+        failedSources: Set<AudioSource>,
+        hasStreamers: Bool
+    ) -> Bool {
+        hasStreamers && sawAudioSources.contains { !failedSources.contains($0) }
+    }
+
     /// Called when a finalized transcript segment is ready
-    var onSegment: ((TranscriptionResult) -> Void)?
+    var onSegment: (@MainActor (TranscriptionResult) -> Void)?
 
     enum ModelState {
         case notLoaded
@@ -193,7 +242,8 @@ final class TranscriptionEngine {
 
         // Streaming backend: straight to the socket, no chunk buffering.
         let streamer: DeepgramStreamer? = bufferLock.withLock {
-            deepgramFailedSources.contains(source) ? nil : deepgramStreamers[source]
+            sawAudioSources.insert(source)
+            return deepgramFailedSources.contains(source) ? nil : deepgramStreamers[source]
         }
         if let streamer {
             streamer.send(samples)
@@ -202,6 +252,10 @@ final class TranscriptionEngine {
 
         bufferLock.withLock {
             audioBuffers[source, default: []].append(contentsOf: samples)
+            let queuedEnd = Double((consumedSamples[source] ?? 0)
+                                   + (audioBuffers[source]?.count ?? 0)) / 16_000
+                + (localClockOffset[source] ?? 0)
+            receivedThrough[source] = max(receivedThrough[source] ?? 0, queuedEnd)
         }
     }
 
@@ -316,6 +370,9 @@ final class TranscriptionEngine {
             deepgramFailedSources = []
             localClockOffset = [:]
             consumedSamples = [.me: 0, .them: 0]
+            completedThrough = [.me: 0, .them: 0]
+            receivedThrough = [:]
+            sawAudioSources = []
         }
         deepgramStreamers = [:]
         if backend == .groq {
@@ -385,16 +442,18 @@ final class TranscriptionEngine {
                     // or the cap / drain forces the cut. Freeing consumed audio
                     // keeps memory flat; the counter and clock offset ride along
                     // in the same lock.
-                    let (chunk, startSample, clockOffset): ([Float], Int, TimeInterval) = self.bufferLock.withLock {
-                        guard let buffered = self.audioBuffers[source], !buffered.isEmpty else { return ([], 0, 0) }
+                    let (chunk, startSample, clockOffset, dequeuedThrough): ([Float], Int, TimeInterval, TimeInterval) = self.bufferLock.withLock {
+                        guard let buffered = self.audioBuffers[source], !buffered.isEmpty else { return ([], 0, 0, 0) }
                         let cut = Segmenter.nextCut(in: buffered, draining: draining)
                         let taken = cut.take.map { Array(buffered[cut.dropLeading ..< cut.dropLeading + $0]) } ?? []
                         let consumed = cut.dropLeading + taken.count
-                        guard consumed > 0 else { return ([], 0, 0) }
+                        guard consumed > 0 else { return ([], 0, 0, 0) }
                         self.audioBuffers[source] = Array(buffered[consumed...])
                         let start = self.consumedSamples[source] ?? 0
                         self.consumedSamples[source] = start + consumed
-                        return (taken, start + cut.dropLeading, self.localClockOffset[source] ?? 0)
+                        let offset = self.localClockOffset[source] ?? 0
+                        return (taken, start + cut.dropLeading, offset,
+                                Double(start + consumed) / 16_000 + offset)
                     }
                     // No rolling preview: it re-decoded the entire pending
                     // utterance every 1.5 s per stream, and Whisper pads every
@@ -404,7 +463,10 @@ final class TranscriptionEngine {
                     // throttles the whole machine mid-call. The typing bubble
                     // shows dots (isHearingSpeech) until the utterance commits;
                     // the committed transcript is byte-identical either way.
-                    guard !chunk.isEmpty else { continue }
+                    guard !chunk.isEmpty else {
+                        self.markCompleted(source: source, through: dequeuedThrough)
+                        continue
+                    }
                     didWork = true
 
                     let startTime = Double(startSample) / 16000.0 + clockOffset
@@ -414,7 +476,10 @@ final class TranscriptionEngine {
                     // silence, so this mostly guards drain-mode tails and keeps
                     // feeding the hallucination filter its energy signal.
                     let energy = chunk.reduce(into: Float(0)) { $0 += abs($1) } / Float(chunk.count)
-                    guard energy > 0.002 else { continue }
+                    guard energy > 0.002 else {
+                        self.markCompleted(source: source, through: dequeuedThrough)
+                        continue
+                    }
 
                     // On-device decode — the default path, and the per-chunk
                     // fallback when a cloud backend hiccups (never lose a chunk).
@@ -511,6 +576,7 @@ final class TranscriptionEngine {
                     } catch {
                         print("Transcription error (\(source.label)): \(error)")
                     }
+                    self.markCompleted(source: source, through: dequeuedThrough)
                 }
 
                 // Pause only when caught up. When a backlog exists (CPU spike or a
@@ -579,6 +645,52 @@ final class TranscriptionEngine {
         let elapsed = Date().timeIntervalSince(meetingStartTime)
         bufferLock.withLock {
             localClockOffset[source] = elapsed - Double(consumedSamples[source] ?? 0) / 16000.0
+        }
+    }
+
+    /// Capture-relative time through which every active locally-decoded source
+    /// has been consumed. The local clock offset is part of the timestamp
+    /// contract: after a mic restart or Deepgram fallback, raw sample counts no
+    /// longer line up with wall-clock meeting time.
+    func consumedThrough(activeSources: Set<AudioSource>) -> TimeInterval {
+        bufferLock.withLock {
+            let active = activeSources.intersection(sawAudioSources).filter {
+                deepgramFailedSources.contains($0) || deepgramStreamers[$0] == nil
+            }
+            guard !active.isEmpty else { return 0 }
+            return active.map { completedThrough[$0] ?? 0 }.min() ?? 0
+        }
+    }
+
+    /// Per-local-source decode targets at a handoff boundary. The target is
+    /// capped at the last buffer received from that source, so a mic that died
+    /// before the boundary cannot stall the gate, while its queued tail still
+    /// must finish before post-processing starts.
+    func completionTargets(through boundary: TimeInterval) -> [AudioSource: TimeInterval] {
+        bufferLock.withLock {
+            Dictionary(uniqueKeysWithValues: sawAudioSources.compactMap { source in
+                guard deepgramFailedSources.contains(source) || deepgramStreamers[source] == nil,
+                      let received = receivedThrough[source] else { return nil }
+                return (source, min(boundary, received))
+            })
+        }
+    }
+
+    func hasCompleted(_ targets: [AudioSource: TimeInterval]) -> Bool {
+        bufferLock.withLock {
+            targets.allSatisfy { source, target in
+                (completedThrough[source] ?? 0) >= target
+            }
+        }
+    }
+
+    func sourcesWithAudio() -> Set<AudioSource> {
+        bufferLock.withLock { sawAudioSources }
+    }
+
+    private func markCompleted(source: AudioSource, through time: TimeInterval) {
+        bufferLock.withLock {
+            completedThrough[source] = max(completedThrough[source] ?? 0, time)
         }
     }
 
