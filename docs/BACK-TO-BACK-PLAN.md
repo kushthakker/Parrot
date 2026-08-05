@@ -74,38 +74,72 @@ later as the `currentTitle` input to the Stage 3 matcher. Refresh `end` each
 tick from the matching ongoing event (an invite extended mid-call must push the
 boundary out); when the event is no longer ongoing, keep the stored values.
 
-### 3.3 The split decision (pure, harness-tested)
+### 3.3 The split decision (pure, harness-tested, **simulation-validated**)
+
+**Revised after executable simulation** (`docs/b2b-simulation.py`, §8.0): the
+first draft keyed on a live "quiet for ≥30 s" clock — and the simulation proved
+that systematically fails the *most common* b2b pattern. When you leave A and
+join B within ~20–50 s (your "instantly jump on the next call"), B's own audio
+resets the quiet clock before any 20 s tick can observe 30 s of silence; only
+the 5-minute force-cap ever fired, putting B's first 2–5 minutes into A. The
+validated rule reads the **segment record** instead — the transcript the engine
+is already producing, which is *exact* once decode passes a window — and makes
+the decision a pure function:
 
 ```swift
+// record: merged speech intervals from the meeting's segments (capture-relative),
+// trustworthy up to `horizon` = engine.consumedThrough().
 struct SplitInputs {
-    var now: Date
-    var currentEnd: Date          // A's scheduled end
-    var nextStart: Date           // B's scheduled start
-    var quietFor: TimeInterval    // now − lastSpeechAt
-    var titleSignal: TitleSignal  // .showsCurrent / .showsNext / .unknown (Stage 3; .unknown until then)
+    var now, horizon: TimeInterval          // capture-relative
+    var recordingStart, currentEnd, nextStart: TimeInterval
+    var speech: [ClosedRange<TimeInterval>] // decoded record, merged
+    var lastSpeechAt: TimeInterval          // live estimate (levels + segments)
+    var titleSignal: TitleSignal
 }
-static func shouldSplit(_ i: SplitInputs) -> Bool {
-    if i.titleSignal == .showsNext { return true }                       // user demonstrably moved on
-    if i.now >= i.currentEnd && i.quietFor >= 30 { return true }         // A over + room quiet
-    if i.now >= i.nextStart.addingTimeInterval(300)                      // force-cap: 5 min into B
-        && i.titleSignal != .showsCurrent { return true }                //   …unless A is provably still on screen
-    return false
+// Find the first silence gap in the record: length ≥ 30s, starting after
+// max(recordingStart, nextStart − 600). Trailing silence (last speech → horizon)
+// counts. Returns the gap, or nil.
+static func splitGap(_ i: SplitInputs) -> ClosedRange<TimeInterval>?
+
+static func splitDecision(_ i: SplitInputs) -> (fire: Bool, boundary: TimeInterval?) {
+    let g = splitGap(i)
+    if i.titleSignal == .showsNext {                       // user demonstrably moved on
+        return (true, g.map { $0.lowerBound + 2 } ?? i.now)  // provisional 'now' if record lags
+    }
+    guard i.titleSignal != .showsCurrent, i.now >= i.currentEnd else { return (false, nil) }
+    if let g {
+        if i.speech.contains(where: { $0.lowerBound >= g.lowerBound + 30 }) {
+            return (true, g.lowerBound + 2)                // switch CONFIRMED: speech after the gap
+        }
+        if i.lastSpeechAt <= g.lowerBound + 5, i.now - g.lowerBound >= 45 {
+            return (true, g.lowerBound + 2)                // stayed quiet past the gap
+        }
+    }
+    if i.now >= i.nextStart + 300 {                        // force-cap: 5 min into B
+        return (true, g.map { $0.lowerBound + 2 } ?? i.now)
+    }
+    return (false, nil)
 }
 ```
 
-Constants: `splitQuietAfter = 30`, `splitForceCap = 300`. Why 30 and not lower
-(review finding): `lastSpeechAt` is fed from an *instantaneous* audio-level
-sample at each 20 s tick plus committed-segment end times that lag by decode
-time — a single tick can sample mid-pause during active speech. 30 s requires
-two consecutive quiet observations, which kills that false positive; it's still
-8× more aggressive than the 240 s full-stop threshold, and a slightly-late cut
-at a scheduled boundary costs almost nothing (both meetings still captured).
+Key properties, each earned in simulation:
+- **The cut lands where the silence is, not when detection happens.** Spans
+  route segments by timestamp (§4.3), so firing 40–70 s late costs *nothing* in
+  Stage 2 — the boundary is backdated into the real inter-call gap.
+- **Gap ≥ 30 s** distinguishes a call switch from conversational pauses (the
+  choppy-speech scenario with 25 s pauses at tick instants never misfires).
+  Switches faster than ~30 s of dead air are title-signal/force-cap territory.
+- **`showsCurrent` blocks the audio paths and the force-cap** — the
+  muted-screenshare-while-skipping-B scenario splits wrongly without this.
+- Stage 1 (interim) uses the same `fire` decision but must cut at detection
+  time (a real stop can't backdate). Simulated worst case at 45 s decode lag:
+  the cut lands up to ~1 min into B, which stays in A's transcript — not lost.
 
 ### 3.4 New while-recording branch (auto recordings only)
 
 1. Update `lastSpeechAt` (existing logic, unchanged).
 2. `next` = earliest ongoing Meet event whose occurrence key is unhandled and ≠ `autoEvent.key`.
-3. If `next` exists and `shouldSplit(...)` → **switch**. Stage 1: set
+3. If `next` exists and `splitDecision(...)` fires → **switch**. Stage 1: set
    `suppressNextTransitionMark`, `await manager.stopRecording()`, clear
    `autoEvent`, do **not** mark `next` handled — the existing auto-start path
    picks B up on a later tick, as soon as `isStopping` clears and the engine is
@@ -211,8 +245,27 @@ tends to leave both readable; not worth cross-meeting dedup complexity.
 **`handoffRecording`** — new:
 
 ```swift
-func handoffRecording(modelContext: ModelContext, title: String?) async throws -> Meeting?
+func handoffRecording(modelContext: ModelContext, title: String?,
+                      boundaryElapsed: TimeInterval) async throws -> Meeting?
 ```
+
+The boundary comes from `splitDecision` (§3.3) — usually *earlier* than the
+call moment, backdated into the recorded silence between the calls.
+
+**Boundary refinement (simulation finding):** the title path can fire before
+the record has caught up to the switch (heavy decode lag) — its `now` boundary
+is provisional. After the handoff, when `consumedThrough() ≥ provisional + 30`,
+search the record for the true silence gap overlapping
+`[provisional − 60, provisional + 30]`; if found, move the span boundary to
+`gap.start + 2` and reassign the few segments that landed in between (update
+`segment.meeting` + re-base their times — SwiftData makes this a trivial loop).
+If the record shows continuous speech there, keep the provisional cut. The
+confirmed-gap and quiet paths already cut exactly and refine to themselves.
+
+Honest cosmetic note: the `.caf` **files** rotate at fire time while the
+**transcript** boundary may be backdated — so a few seconds of B's audio can
+physically sit at the tail of A's file. Playback-only; the transcript (what
+cleanup, summary, and the user read) is always cut correctly.
 
 1. `guard isRecording, !isStopping, !isHandingOff` (+ new `isHandingOff` flag; `stopRecording` also guards `!isHandingOff`).
 2. `boundaryElapsed = Date.now − captureEpoch`. `captureEpoch` must be **the
@@ -354,9 +407,31 @@ the user skipping B while A runs long (never force-split while `showsCurrent`).
 
 ## 8. Test plan
 
+### 8.0 Executable simulation (already run — this is how §3.3 got its shape)
+
+`docs/b2b-simulation.py` models the full tick state machine against 12
+scenarios × 4 tick phases × 2 decode lags (10 s / 45 s thermal throttle), for
+Stage 1 and Stage 2, checking five invariants (per-meeting coverage, zero
+speech loss, no overlap/double-start, no poisoning, cut-lands-in-silence).
+Result: **Stage 2 planned design passes all 96 runs**; Stage 1 passes except
+the two documented cut-at-detection cases at 45 s lag. Two sabotage variants
+prove the rules are load-bearing: stopped-tick marking fails "manual stop 5 s
+before the boundary" (B poisoned forever), and removing the `showsCurrent`
+block fails "skip B" and "muted screenshare" (wrong split). The scenarios
+include: clean b2b with a late join, overrun with/without title, skipped B
+(with/without title, with a muted stretch), triple header, manual stops (mid-A
+and at boundary−5 s), a 10-min gap, overlapping invites, and choppy speech with
+pauses aligned to tick instants. Re-run it after any rule change — it's the
+spec.
+
 **Harness (`make test`, ProfileTest.swift) — pure functions, no audio needed:**
-- `shouldSplit` matrix: boundary+quiet ✓, boundary+speech ✗, force-cap ✓,
-  force-cap+`showsCurrent` ✗, `showsNext` immediate ✓, pre-boundary quiet ✗.
+- `splitGap` / `splitDecision` ports of the simulation matrix: confirmed-switch
+  gap ✓, fast-switch 35 s gap ✓ (the case the quiet-clock draft failed),
+  choppy 25 s pauses ✗, quiet-persists path ✓, force-cap ✓,
+  force-cap+`showsCurrent` ✗, `showsNext` with lagging record → provisional
+  `now` ✓, pre-`currentEnd` audio paths ✗.
+- Boundary refinement: provisional cut + record catching up → moved into the
+  true gap, segments in between reassigned; continuous speech → provisional kept.
 - `titleSignal`: exact/partial/case-insensitive matches, short-title refusal,
   both-match precedence, no Meet window → `.unknown`.
 - Span routing: segment at boundary−ε → A, boundary+ε → B (local time re-based),
