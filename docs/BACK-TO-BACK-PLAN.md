@@ -58,11 +58,21 @@ the events ongoing *at that tick* handled. Same protection, no poison. (Handoffs
 happen inside one tick, so no stopped-state tick is observed and nothing gets
 spuriously marked — the handoff marks B handled itself.)
 
+**⚠ Self-poisoning guard (review finding):** Stage 1's split is itself a
+stop — without care, the transition rule fires on the very next tick and marks
+B handled, recreating the bug. A **scheduler-initiated** split-stop must
+suppress the transition-marking: set `suppressNextTransitionMark = true` before
+`await manager.stopRecording()` and consume the flag when the stopped tick is
+observed. (Auto-stop keeps marking — ongoing is empty then anyway; manual stops
+keep marking — that's the protection's whole point.)
+
 ### 3.2 Track what the recording covers
 
-`autoOccurrenceKey: String?` becomes `autoEvent: (key: String, end: Date)?`.
-Refresh `end` each tick from the matching ongoing event (an invite extended
-mid-call must push the boundary out).
+`autoOccurrenceKey: String?` becomes
+`autoEvent: (key: String, end: Date, title: String?)?` — `title` is needed
+later as the `currentTitle` input to the Stage 3 matcher. Refresh `end` each
+tick from the matching ongoing event (an invite extended mid-call must push the
+boundary out); when the event is no longer ongoing, keep the stored values.
 
 ### 3.3 The split decision (pure, harness-tested)
 
@@ -76,22 +86,35 @@ struct SplitInputs {
 }
 static func shouldSplit(_ i: SplitInputs) -> Bool {
     if i.titleSignal == .showsNext { return true }                       // user demonstrably moved on
-    if i.now >= i.currentEnd && i.quietFor >= 20 { return true }         // A over + room quiet
+    if i.now >= i.currentEnd && i.quietFor >= 30 { return true }         // A over + room quiet
     if i.now >= i.nextStart.addingTimeInterval(300)                      // force-cap: 5 min into B
         && i.titleSignal != .showsCurrent { return true }                //   …unless A is provably still on screen
     return false
 }
 ```
 
-Constants: `splitQuietAfter = 20` (vs 240 for full stop — a wrong cut at a
-scheduled boundary costs almost nothing; both meetings are still captured),
-`splitForceCap = 300`.
+Constants: `splitQuietAfter = 30`, `splitForceCap = 300`. Why 30 and not lower
+(review finding): `lastSpeechAt` is fed from an *instantaneous* audio-level
+sample at each 20 s tick plus committed-segment end times that lag by decode
+time — a single tick can sample mid-pause during active speech. 30 s requires
+two consecutive quiet observations, which kills that false positive; it's still
+8× more aggressive than the 240 s full-stop threshold, and a slightly-late cut
+at a scheduled boundary costs almost nothing (both meetings still captured).
 
 ### 3.4 New while-recording branch (auto recordings only)
 
 1. Update `lastSpeechAt` (existing logic, unchanged).
 2. `next` = earliest ongoing Meet event whose occurrence key is unhandled and ≠ `autoEvent.key`.
-3. If `next` exists and `shouldSplit(...)` → **switch**. Stage 1: `await manager.stopRecording()`, clear `autoEvent`, do **not** mark `next` handled — the existing auto-start path picks B up on a later tick, as soon as `isStopping` clears and the engine is ready (gap ≈ drain time; Stage 2 removes it). Stage 2: call `handoffRecording` instead (§4), then set `autoEvent` to next, mark next handled, `lastSpeechAt = now`.
+3. If `next` exists and `shouldSplit(...)` → **switch**. Stage 1: set
+   `suppressNextTransitionMark`, `await manager.stopRecording()`, clear
+   `autoEvent`, do **not** mark `next` handled — the existing auto-start path
+   picks B up on a later tick, as soon as `isStopping` clears and the engine is
+   ready (gap ≈ drain time; Stage 2 removes it). Stage 2: call
+   `handoffRecording` instead (§4); **only on success** set `autoEvent` to
+   next, mark next handled, `lastSpeechAt = now`. On failure keep recording A
+   (the safe default) and leave next unhandled so the next tick retries; after
+   3 failed attempts mark next handled to stop a 20 s retry storm (mirrors how
+   auto-start already prefers giving up over prompting/spamming).
 4. Auto-stop rule unchanged (no ongoing Meet at all + 240 s quiet / 45 min cap).
 
 Manual recordings (`autoEvent == nil`): never split, never auto-stop — exactly
@@ -113,26 +136,43 @@ boundary is bookkeeping.
 ```
 
 - New timestamped URLs (same naming scheme as `startCapture`).
-- `systemWriteQueue.sync { systemAudioFile = nil; fileGeneration += 1 }` (and mic
-  queue likewise) — the serial `sync` is a barrier: every already-enqueued write
-  lands first, then the old `AVAudioFile` deallocates ⇒ `.caf` header finalized.
-- Then swap `systemAudioURL` / `micAudioURL`; return the new pair.
+- Per stream: `writeQueue.sync { audioFile = nil; queueURL = newURL }` — the
+  serial `sync` is a barrier: every already-enqueued write lands first (into the
+  old file), then the old `AVAudioFile` deallocates ⇒ `.caf` header finalized,
+  and the queue-confined URL flips in the same block.
+- Then update the main-actor `systemAudioURL` / `micAudioURL` (UI/meeting
+  bookkeeping only); return the new pair.
 
-**Truncation hazard (must-fix):** `appendAudio` captures the URL at enqueue time
-and the write block lazily recreates `AVAudioFile(forWriting:)` — which
-**truncates**. A write enqueued just before rotation but run just after would
-recreate A's finished file and destroy it (same hazard `filesClosed` guards in
-`stopCapture`, see `AudioCaptureManager.swift:21`). Fix: `appendAudio` also
-captures `fileGeneration`; the write block drops the buffer if the generation
-changed. Worst case: ~20 ms of audio at the boundary is dropped instead of a
-finished file being truncated.
+**Truncation hazard (must-fix, design revised in review):** today `appendAudio`
+captures the URL at enqueue time and the write block lazily recreates
+`AVAudioFile(forWriting:)` — which **truncates**. That capture is safe today
+only because the URL never changes mid-session; rotation makes it a live race
+(a write enqueued around the rotation could recreate — and destroy — A's
+finished file; same hazard class `filesClosed` guards in
+`AudioCaptureManager.swift:21`). A generation-token check is NOT sufficient:
+URL and token are read in two non-atomic steps from the capture thread, so
+(old URL, new token) can still pair up. The airtight fix is **queue-confined
+URL ownership**: the write block never uses an enqueue-time URL at all — it
+reads `queueURL`, a property owned by its own serial queue, mutated only
+inside `queue.sync` blocks (rotation above; `startCapture` seeds it the same
+way before any write exists). Serial FIFO then guarantees: writes enqueued
+before the rotation block run before it (old file object still set → append to
+A); writes after it see file == nil and `queueURL` == new → lazily create B's
+file. No token, no extra lock on the hot path, no reachable truncation state.
+`filesClosed` behavior at final stop is unchanged.
 
 Mic-less recordings: mic side is a no-op, returns `nil` (B is single-track like A).
 
 ### 4.2 `TranscriptionEngine` — two tiny additions, loop untouched
 
 - `func consumedThrough() -> TimeInterval` — under `bufferLock`, `min` over
-  **active** sources of `consumedSamples[source] / 16_000`. Skip `.me` when the
+  **active** sources of `consumedSamples[source] / 16_000 +
+  (localClockOffset[source] ?? 0)`. The offset term is load-bearing (review
+  finding): it is exactly how segment timestamps are computed
+  (`TranscriptionEngine.swift:410`), and after a mid-call mic device change
+  `reanchorLocalClock` shifts the mic clock forward to skip the dead gap —
+  without it, the mic's raw sample count sits permanently behind wall-clock and
+  every finalize gate would wait out its full 180 s cap. Skip `.me` when the
   mic never delivered (its counter would sit at 0 forever and stall the wait —
   pass the active-source set in, or derive from a `sawAudio` flag per source).
 - `var isStopped: Bool` — `transcriptionTask == nil`. A finished drain implies
@@ -161,6 +201,12 @@ span containing `result.startTime` (engine times are capture-relative); convert
 to meeting-local by subtracting `span.startElapsed`; run the existing
 echo-dedup + insert against *that* span's meeting with local times. A drain-tail
 segment arriving after the handoff still lands in A — correctly, automatically.
+Extract the lookup as a pure helper for the harness:
+`static func spanIndex(for time: TimeInterval, boundaries: [TimeInterval]) -> Int`.
+Accepted limitation: the ±2.5 s echo-dedup window can't see across the
+boundary, so one echoed line straddling the cut could survive as a duplicate
+(one copy at A's tail, one at B's head) — cosmetic, rare, and the cleanup pass
+tends to leave both readable; not worth cross-meeting dedup complexity.
 
 **`handoffRecording`** — new:
 
@@ -169,7 +215,11 @@ func handoffRecording(modelContext: ModelContext, title: String?) async throws -
 ```
 
 1. `guard isRecording, !isStopping, !isHandingOff` (+ new `isHandingOff` flag; `stopRecording` also guards `!isHandingOff`).
-2. `boundaryElapsed = Date.now − captureEpoch` (new `captureEpoch` stored at `startRecording`; == A's `recordingStartTime`).
+2. `boundaryElapsed = Date.now − captureEpoch`. `captureEpoch` must be **the
+   same `Date` value passed to `startTranscribing(meetingStartTime:)`** —
+   today `startRecording` calls `.now` twice a few ms apart
+   (`RecordingManager.swift:228,232`); store one value and pass it to both, so
+   the boundary and the engine's segment clock share an epoch exactly.
 3. Close A: `spans[last].endElapsed = boundaryElapsed`; `meeting.duration = boundaryElapsed − span.startElapsed`; `status = .processing`; save.
 4. Create B via `makeMeeting()` (extract the meeting-creation block from `startRecording:183–191` — profile, brief, snapshot — so both paths share it).
 5. `let urls = audioCaptureManager.rotateFiles()`; assign B's `systemAudioPath` / `micAudioPath`; set B's title from the event invite.
@@ -217,6 +267,17 @@ cost row. Fix (no provider-protocol change):
    called from post-chains now.
 3. Delete `resetUsage()` from `startRecording` (`RecordingManager.swift:229`) —
    it belongs to the chain.
+4. **The gate must wrap every provider-calling chain, not just live stops
+   (review finding):** there are four — the stop chain
+   (`RecordingManager.swift:279–292`), the handoff finalize chain (new), the
+   **import** chain (`RecordingManager.swift:389–390`), and the launch-time
+   **crash-recovery** chain (`finishRecovery`,
+   `RecordingManager.swift:143–144`). Recovery today spawns one concurrent
+   Task per interrupted meeting — two recovered meetings already garble each
+   other's meters in the current build; routing all four through the gate fixes
+   that pre-existing bug as a side effect. Import/recovery keep their existing
+   `backendOverride`/no-cleaning shapes; only the reset-and-read moves inside
+   the gate.
 
 Cleaning tokens already travel by value (`TranscriptCleaner` returns its own
 totals) — unaffected.
@@ -286,6 +347,8 @@ the user skipping B while A runs long (never force-split while `showsCurrent`).
 | Recurring events | Occurrence keys (`id@epoch`) already disambiguate; unchanged. |
 | Meeting invite extended mid-call | `autoEvent.end` refreshed each tick → boundary pushes out. |
 | Later, unrelated recording starts | Fresh `startTranscribing` resets engine counters — safe, because any prior finalize-wait already exited via `isStopped` (a new start requires the old drain to have finished). |
+| User deletes meeting A while its finalize chain is waiting/running | Pre-existing race (today's stop-chain has it too), slightly widened by the gate wait. Chain checks `meeting.isDeleted` after the gate and before each save; a deleted meeting's chain exits silently. |
+| App quits/crashes mid-session with A `.processing` and B `.recording` | Launch-time `recoverInterruptedRecordings` already handles both statuses per meeting independently: A re-runs its chain (segments exist), B is salvaged or failed-if-empty. Spans are in-memory only — nothing to persist. |
 
 ---
 
@@ -298,7 +361,10 @@ the user skipping B while A runs long (never force-split while `showsCurrent`).
   both-match precedence, no Meet window → `.unknown`.
 - Span routing: segment at boundary−ε → A, boundary+ε → B (local time re-based),
   three-span chain, tail segment after span closed.
-- Transition rule: running→stopped marks ongoing handled; handoff tick does not.
+- Transition rule: running→stopped marks ongoing handled; handoff tick does
+  not; a **split-stop with `suppressNextTransitionMark` set does not** (the
+  Stage 1 self-poisoning regression test — this exact case is why the flag
+  exists).
 
 **Live validation (needs the Google account synced into macOS Calendar —
 System Settings → Internet Accounts; still the outstanding setup step):**
@@ -320,12 +386,13 @@ import, mic-less recording, cleanup/summary/usage on a normal call.
 
 ## 9. Risks & mitigations (ranked)
 
-1. **File truncation at rotation** — generation token (§4.1). The one bug that
-   destroys data; the mitigation is structural, not probabilistic.
-2. **Cleanup on incomplete transcript** — consumedThrough gate + `isStopped`
-   escape + cap (§4.4).
-3. **Meter cross-attribution** — serial gate + reset-in-chain + delete the
-   startRecording reset (§4.5).
+1. **File truncation at rotation** — queue-confined URL ownership (§4.1; a
+   generation token was considered and rejected as still racy). The one bug
+   that destroys data; the mitigation is structural, not probabilistic.
+2. **Cleanup on incomplete transcript** — consumedThrough gate (offset-aware,
+   §4.2) + `isStopped` escape + cap (§4.4).
+3. **Meter cross-attribution** — serial gate around all four provider chains +
+   reset-in-chain + delete the startRecording reset (§4.5).
 4. **Tick reentrancy** — all new decision work stays inside the existing
    `tickInFlight` guard; `handoffRecording` has its own `isHandingOff` flag and
    mutual guards with `stopRecording`. (Every `await` on @MainActor is an
